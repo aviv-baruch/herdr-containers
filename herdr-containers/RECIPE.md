@@ -38,7 +38,7 @@ One folder, `herdr-containers/`, contains five `mods/<name>/` folders and `keys.
 | `mods/settings-containers` | Copy of shipped frame Settings. Adds Containers switches using `shared` / `setShared`; keeps shipped `hc`, `run`, `readTextFile`, `writeTextFile`, and `appHome` settings and machine controls. |
 | `mods/workspace-chrome-containers` | Copy of shipped chrome. `props().footer` selects footer or brand rendering. Footer Settings opens `settings-containers` with `openOverlay`; other actions keep shipped `run` and `layout.resize`. |
 
-Add this block to the current layout's sidebar column `sidebar-lists`, after Spaces in shipped `main`. Keep its id `containers`: folding calls `layout.resize` on that id and treats 35 px or less as folded.
+Add this block to the current layout's sidebar column `sidebar-lists`, after Spaces in shipped `main`. Shipped layouts are replaced on every start (an edited one moves to `<name>-edited`), so if the current layout is shipped, clone it first: `herdr-app do layout.clone '{"name":"main","as":"my-layout"}'`, then edit `layouts/my-layout.json`. Keep its id `containers`: folding calls `layout.resize` on that id and treats 35 px or less as folded.
 
 ```json
 { "id": "containers", "type": "block", "size": { "weight": 1 }, "min": 35, "content": { "mod": "containers" } }

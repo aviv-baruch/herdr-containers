@@ -59,6 +59,12 @@ app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
 )
 ```
 
+Herdr replaces its shipped layouts (`main`, `terminals`, `win98`) on every start, so edit a layout of your own. If you use a shipped one, clone it first; this switches to the clone:
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"my-layout"}'
+```
+
 Add this block after Spaces in the `sidebar-lists` column of `$app_home/layouts/<your-layout>.json` (or another suitable column). Keep id `containers` even if you rename the mod: folding resizes that id. Use the renamed mod name in `content.mod` if needed.
 
 ```json
