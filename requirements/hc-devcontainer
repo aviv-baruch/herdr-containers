@@ -7,10 +7,13 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
 FOLDER_LABELS = ("devcontainer.local_folder", "vsch.local.folder")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+ENV_REFERENCE = re.compile(r"\$\{(containerEnv|localEnv):([^}:]+)(?::([^}]*))?\}")
 
 
 def metadata(raw):
@@ -39,6 +42,32 @@ def metadata_has_feature(raw):
                for entry in metadata(raw))
 
 
+def metadata_remote_env(raw, container_env):
+    base = {}
+    for item in container_env or []:
+        if isinstance(item, str) and "=" in item:
+            name, value = item.split("=", 1)
+            base[name] = value
+
+    def resolve(match):
+        source = base if match[1] == "containerEnv" else os.environ
+        return source.get(match[2], match[3] or "")
+
+    remote = {}
+    for entry in metadata(raw):
+        values = entry.get("remoteEnv")
+        if not isinstance(values, dict):
+            continue
+        for name, value in values.items():
+            if not isinstance(name, str) or not ENV_NAME.fullmatch(name):
+                continue
+            if value is None:
+                remote.pop(name, None)
+            elif isinstance(value, str):
+                remote[name] = ENV_REFERENCE.sub(resolve, value)
+    return remote
+
+
 def machine_name(folder):
     raw = os.path.basename(folder.rstrip(os.sep))
     ascii_lower = "".join(c.lower() if c.isascii() else "-" for c in raw)
@@ -50,9 +79,32 @@ def machine_name(folder):
     return name
 
 
-def exec_argv(docker, container_id, user, line):
+def exec_argv(docker, container_id, user, line, remote_env=None):
+    script = """if [ -z "${SHELL:-}" ]; then
+    unset SHELL
+    user=$(id -un)
+    if command -v getent >/dev/null 2>&1; then
+        shell=$(getent passwd "$user" | awk -F: -v user="$user" '$1 == user { print $7; exit }')
+    else
+        shell=$(awk -F: -v user="$user" '$1 == user { print $7; exit }' /etc/passwd)
+    fi
+    [ -z "$shell" ] || export SHELL="$shell"
+fi
+exec sh -c "$1"
+"""
     return [docker, "exec", "-i", *(["-u", user] if user else []),
-            container_id, "sh", "-c", line]
+            *(part for name in (remote_env or {}) if isinstance(name, str) and ENV_NAME.fullmatch(name)
+              for part in ("-e", name)),
+            container_id, "sh", "-c", script, "sh", line]
+
+
+def exec_container(docker, row, container_id, line):
+    remote = {name: value for name, value in row.get("remote_env", {}).items()
+              if isinstance(name, str) and ENV_NAME.fullmatch(name)}
+    env = {**os.environ, **remote}
+    # A remote PATH must not change where the host finds Docker.
+    executable = (shutil.which(docker) or docker) if "PATH" in remote else docker
+    os.execvpe(executable, exec_argv(docker, container_id, row["user"], line, remote), env)
 
 
 def shell_quote(value):
@@ -129,7 +181,7 @@ def rows(containers):
         # Folderless CLI builds use vsc-* images; metadata on other images alone is insufficient.
         devcontainer = bool(folder or ("devcontainer.metadata" in labels and re.fullmatch(r"vsc-.+", config.get("Image") or "")))
         name = item.get("Name", "").lstrip("/")
-        found.append({
+        row = {
             "folder": folder,
             "name": name,
             "id": item["Id"],
@@ -142,7 +194,11 @@ def rows(containers):
             "via": f"hc-devcontainer {shell_quote(folder)}" if folder else f"hc-devcontainer --container {shell_quote(name)}",
             "suggested_name": machine_name(folder if folder else name),
             "created": item.get("Created", ""),
-        })
+        }
+        remote_env = metadata_remote_env(raw, config.get("Env"))
+        if remote_env:
+            row["remote_env"] = remote_env
+        found.append(row)
     found.sort(key=lambda row: (row["kind"] != "devcontainer", row["folder"], row["name"]))
     seen = set()
     for row in found:
@@ -193,6 +249,7 @@ def main(argv=None):
         if args.json:
             for row in found:
                 row.pop("created")
+                row.pop("remote_env", None)
             print(json.dumps(found))
         else:
             for row in found:
@@ -227,7 +284,7 @@ def main(argv=None):
         found = [row for row in rows(inspect(docker, [args.container])) if row["state"] == "running"]
         if not found:
             raise RuntimeError(f"container {args.container!r} is not running")
-        os.execvp(docker, exec_argv(docker, found[0]["name"], found[0]["user"], args.args[0]))
+        exec_container(docker, found[0], found[0]["name"], args.args[0])
         return 0
     if len(args.args) != 2:
         parser.error("expected <folder> <line>, or --container NAME <line>")
@@ -240,7 +297,7 @@ def main(argv=None):
     found.sort(key=lambda row: row["created"], reverse=True)
     if len(found) > 1:
         print(f"hc-devcontainer: {len(found)} containers match; using newest {found[0]['id']}", file=sys.stderr)
-    os.execvp(docker, exec_argv(docker, found[0]["id"], found[0]["user"], line))
+    exec_container(docker, found[0], found[0]["id"], line)
 
 
 if __name__ == "__main__":

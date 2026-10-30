@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -49,6 +51,42 @@ class MetadataUserTests(unittest.TestCase):
             self.assertFalse(helper.metadata_has_feature(json.dumps([{"id": bad}])), bad)
         self.assertFalse(helper.metadata_has_feature("bad json"))
 
+    def test_remote_env_merges_in_order_and_null_removes(self):
+        dev = {
+            "Config": {"Env": ["PATH=/usr/bin:/bin", "BASE=container"], "Labels": {
+                "devcontainer.local_folder": "/work",
+                "devcontainer.metadata": json.dumps([
+                    {"remoteEnv": {"KEEP": "first", "DROP": "old", "SHELL": "/bin/fish"}},
+                    {"remoteEnv": {"KEEP": "last", "DROP": None, "FROM_BASE": "${containerEnv:BASE}"}},
+                ]),
+            }}, "Id": "dev", "Name": "/dev",
+        }
+        self.assertEqual(helper.rows([dev])[0]["remote_env"],
+                         {"KEEP": "last", "SHELL": "/bin/fish", "FROM_BASE": "container"})
+
+    def test_remote_env_substitutions_and_defaults(self):
+        dev = {
+            "Config": {"Env": ["PATH=/usr/bin:/bin", "EMPTY="], "Labels": {
+                "devcontainer.local_folder": "/work",
+                "devcontainer.metadata": json.dumps([{"remoteEnv": {
+                    "PATH": "${containerEnv:PATH}:/x",
+                    "CONTAINER_DEFAULT": "${containerEnv:MISSING:/default}",
+                    "CONTAINER_EMPTY": "${containerEnv:EMPTY:fallback}",
+                    "HOST": "${localEnv:HOST_VALUE}",
+                    "HOST_DEFAULT": "${localEnv:MISSING:/host-default}",
+                    "MISSING": "${containerEnv:UNKNOWN}/${localEnv:MISSING}",
+                    "OTHER": "${workspaceFolder}/${env:KEEP}",
+                }}]),
+            }}, "Id": "dev", "Name": "/dev",
+        }
+        with patch.dict(os.environ, {"HOST_VALUE": "from-host"}, clear=True):
+            remote = helper.rows([dev])[0]["remote_env"]
+        self.assertEqual(remote, {
+            "PATH": "/usr/bin:/bin:/x", "CONTAINER_DEFAULT": "/default",
+            "CONTAINER_EMPTY": "", "HOST": "from-host", "HOST_DEFAULT": "/host-default",
+            "MISSING": "/", "OTHER": "${workspaceFolder}/${env:KEEP}",
+        })
+
 
 class NameTests(unittest.TestCase):
     def test_name_rules(self):
@@ -62,12 +100,77 @@ class NameTests(unittest.TestCase):
 class ArgvTests(unittest.TestCase):
     def test_user_and_line_are_separate_args(self):
         line = "printf 'hi'; echo '$HOME'"
-        self.assertEqual(helper.exec_argv("docker", "abc", "vscode", line),
-                         ["docker", "exec", "-i", "-u", "vscode", "abc", "sh", "-c", line])
+        argv = helper.exec_argv("docker", "abc", "vscode", line)
+        self.assertEqual(argv[:8], ["docker", "exec", "-i", "-u", "vscode", "abc", "sh", "-c"])
+        self.assertEqual(argv[-2:], ["sh", line])
+        self.assertIn('"$1"', argv[-3])
+        self.assertNotIn(line, argv[-3])
 
     def test_no_user(self):
-        self.assertEqual(helper.exec_argv("podman", "abc", None, "true"),
-                         ["podman", "exec", "-i", "abc", "sh", "-c", "true"])
+        argv = helper.exec_argv("podman", "abc", None, "true")
+        self.assertEqual(argv[:6], ["podman", "exec", "-i", "abc", "sh", "-c"])
+        self.assertEqual(argv[-2:], ["sh", "true"])
+
+    def test_remote_env_argv_has_names_only(self):
+        argv = helper.exec_argv("docker", "abc", None, "true",
+                                {"TOKEN": "secret-value", "9BAD": "invalid", "BAD-NAME": "invalid",
+                                 None: "invalid"})
+        self.assertEqual(argv[:6], ["docker", "exec", "-i", "-e", "TOKEN", "abc"])
+        self.assertNotIn("secret-value", argv)
+        self.assertNotIn("9BAD", argv)
+        self.assertNotIn("BAD-NAME", argv)
+
+    def test_wrapper_runs_quoted_line_and_sets_shell_only_when_missing(self):
+        line = (
+            "printf '<%s>\\n' 'a \"quoted\" value'; "
+            "env | awk -F= '$1 == \"SHELL\" { print; found=1; exit } "
+            "END { if (!found) print \"SHELL=unset\" }'"
+        )
+        argv = helper.exec_argv("docker", "abc", None, line)
+        with tempfile.TemporaryDirectory() as temp:
+            fake_id = Path(temp) / "id"
+            fake_id.write_text("#!/bin/sh\nprintf '%s\\n' testuser\n")
+            fake_id.chmod(0o755)
+            fake_getent = Path(temp) / "getent"
+            fake_getent.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = passwd ] && [ \"$2\" = testuser ] && [ \"$PASSWD_FOUND\" = 1 ] || exit 1\n"
+                "printf '%s\\n' 'other:x:1:1::/home/other:/wrong' "
+                "'testuser:x:1000:1000::/home/testuser:/bin/zsh'\n"
+            )
+            fake_getent.chmod(0o755)
+            base_env = {**os.environ, "PATH": f"{temp}:{os.environ['PATH']}", "PASSWD_FOUND": "1"}
+            base_env.pop("SHELL", None)
+            for shell, found, expected in (
+                (None, "1", '<a "quoted" value>\nSHELL=/bin/zsh\n'),
+                ("/existing/shell", "1", '<a "quoted" value>\nSHELL=/existing/shell\n'),
+                ("", "1", '<a "quoted" value>\nSHELL=/bin/zsh\n'),
+                (None, "0", '<a "quoted" value>\nSHELL=unset\n'),
+            ):
+                with self.subTest(shell=shell, found=found):
+                    env = {**base_env, "PASSWD_FOUND": found}
+                    if shell is not None:
+                        env["SHELL"] = shell
+                    script = ("unset SHELL; " if shell is None else "") + argv[-3]
+                    result = subprocess.run(["/bin/sh", "-c", script, *argv[-2:]], env=env,
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
+    def test_wrapper_uses_passwd_without_getent(self):
+        user, *_, shell = next(line.split(":") for line in Path("/etc/passwd").read_text().splitlines()
+                               if line.count(":") == 6 and line.split(":")[6])
+        argv = helper.exec_argv("docker", "abc", None, 'printf "%s\\n" "$SHELL"')
+        with tempfile.TemporaryDirectory() as temp:
+            fake_id = Path(temp) / "id"
+            fake_id.write_text(f"#!/bin/sh\nprintf '%s\\n' '{user}'\n")
+            fake_id.chmod(0o755)
+            (Path(temp) / "awk").symlink_to(shutil.which("awk"))
+            (Path(temp) / "sh").symlink_to("/bin/sh")
+            result = subprocess.run(["/bin/sh", "-c", "unset SHELL; " + argv[-3], *argv[-2:]],
+                                    env={"PATH": temp}, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, shell + "\n")
 
 
 class ContainerTests(unittest.TestCase):
@@ -145,11 +248,11 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(row["user"], "vscode")
         self.assertEqual(row["via"], "hc-devcontainer --container 'dev-work'")
         with patch.object(helper, "inspect", return_value=[dev]) as inspect, \
-                patch.object(helper.os, "execvp") as execvp:
+                patch.object(helper.os, "execvpe") as execvpe:
             self.assertEqual(helper.main(["--container", "dev-work", "true"]), 0)
         inspect.assert_called_once_with("docker", ["dev-work"])
-        execvp.assert_called_once_with("docker", ["docker", "exec", "-i", "-u", "vscode",
-                                                   "dev-work", "sh", "-c", "true"])
+        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-work", "vscode", "true"),
+                                        dict(os.environ))
 
     def test_folderless_vsc_image_with_metadata_is_devcontainer(self):
         for image in ("vsc-acme-abc", "vsc-acme-abc-uid", "vsc-acme-abc-features"):
@@ -162,9 +265,9 @@ class ContainerTests(unittest.TestCase):
                 row = helper.rows([dev])[0]
                 self.assertEqual((row["kind"], row["folder"], row["user"]), ("devcontainer", "", "vscode"))
                 self.assertEqual(row["via"], "hc-devcontainer --container 'frosty_rubin'")
-        with patch.object(helper, "inspect", return_value=[dev]), patch.object(helper.os, "execvp") as execvp:
+        with patch.object(helper, "inspect", return_value=[dev]), patch.object(helper.os, "execvpe") as execvpe:
             helper.main(["--container", "frosty_rubin", "true"])
-        self.assertEqual(execvp.call_args.args[1][4:7], ["vscode", "frosty_rubin", "sh"])
+        self.assertEqual(execvpe.call_args.args[1][4:7], ["vscode", "frosty_rubin", "sh"])
 
     def test_metadata_on_non_vsc_image_stays_plain(self):
         dev = copy.deepcopy(self.dev)
@@ -183,11 +286,11 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(row["via"], "hc-devcontainer '/home/me/My Project'")
         with patch.object(helper, "inspect", return_value=[dev]), \
                 patch.object(helper, "folder_ids", return_value=["dev-id"]) as folder_ids, \
-                patch.object(helper.os, "execvp") as execvp:
+                patch.object(helper.os, "execvpe") as execvpe:
             self.assertIsNone(helper.main(["/home/me/My Project", "true"]))
         folder_ids.assert_called_once_with("docker")
-        execvp.assert_called_once_with("docker", ["docker", "exec", "-i", "-u", "builder",
-                                                   "dev-id", "sh", "-c", "true"])
+        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "builder", "true"),
+                                        dict(os.environ))
 
     def test_ls_via_round_trips_through_sh_for_odd_labels(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -205,10 +308,10 @@ class ContainerTests(unittest.TestCase):
                     via = json.loads(output.getvalue())[0]["via"]
                     # hc runs: sh -c '<via> "$1"' sh <line>
                     argv = shlex.split(via)[1:] + ["true"]
-                    with patch.object(helper.os, "execvp") as execvp:
+                    with patch.object(helper.os, "execvpe") as execvpe:
                         helper.main(argv)
-                execvp.assert_called_once_with("docker", ["docker", "exec", "-i", "-u", "vscode",
-                                                           "dev-id", "sh", "-c", "true"])
+                execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "vscode", "true"),
+                                                dict(os.environ))
 
     def test_newest_of_several_matches_wins_and_warns(self):
         old = copy.deepcopy(self.dev)
@@ -217,17 +320,18 @@ class ContainerTests(unittest.TestCase):
         new["Id"], new["Created"] = "new-id", "2026-10-30T00:00:00Z"
         with patch.object(helper, "inspect", return_value=[old, new]), \
                 patch.object(helper, "folder_ids", return_value=[]), \
-                patch.object(helper.os, "execvp") as execvp:
+                patch.object(helper.os, "execvpe") as execvpe:
             errors = io.StringIO()
             with redirect_stderr(errors):
                 helper.main(["/home/me/My Project", "true"])
-        self.assertEqual(execvp.call_args.args[1][-4], "new-id")
+        self.assertEqual(execvpe.call_args.args[1][-6], "new-id")
         self.assertIn("2 containers match; using newest new-id", errors.getvalue())
 
     def test_shell_quote_handles_apostrophe(self):
         self.assertEqual(helper.shell_quote("a'b"), "'a'\\''b'")
 
     def test_ls_all_json(self):
+        self.dev["Config"]["Labels"]["devcontainer.metadata"] = '[{"remoteEnv":{"TOKEN":"secret-value"}}]'
         with patch.object(helper, "inspect", return_value=[self.plain, self.dev]), \
                 patch.object(helper, "ps", return_value=[]):
             output = io.StringIO()
@@ -236,6 +340,35 @@ class ContainerTests(unittest.TestCase):
             listed = json.loads(output.getvalue())
         self.assertEqual([r["id"] for r in listed], ["dev-id", "plain-id"])
         self.assertNotIn("created", listed[0])
+        self.assertNotIn("remote_env", listed[0])
+        self.assertNotIn("secret-value", output.getvalue())
+
+    def test_remote_env_reaches_both_connect_paths_without_argv_values(self):
+        dev = copy.deepcopy(self.dev)
+        dev["Config"]["Env"] = ["PATH=/usr/bin:/bin"]
+        dev["Config"]["Labels"]["devcontainer.metadata"] = json.dumps([{"remoteUser": "vscode", "remoteEnv": {
+            "PATH": "${containerEnv:PATH}:/custom", "SHELL": "/bin/fish",
+            "TOKEN": "secret-value", "BAD-NAME": "skip-me",
+        }}])
+        for command, container_id in ((["/home/me/My Project", "true"], "dev-id"),
+                                      (["--container", "dev-work", "true"], "dev-work")):
+            with self.subTest(command=command), \
+                    patch.object(helper, "inspect", return_value=[dev]), \
+                    patch.object(helper, "folder_ids", return_value=["dev-id"]), \
+                    patch.object(helper.shutil, "which", return_value="/usr/bin/docker"), \
+                    patch.object(helper.os, "execvpe") as execvpe:
+                helper.main(command)
+                executable, argv, env = execvpe.call_args.args
+            self.assertEqual(executable, "/usr/bin/docker")
+            self.assertEqual(argv[:11], ["docker", "exec", "-i", "-u", "vscode",
+                                         "-e", "PATH", "-e", "SHELL", "-e", "TOKEN"])
+            self.assertEqual(argv[11], container_id)
+            self.assertNotIn("secret-value", argv)
+            self.assertNotIn("skip-me", argv)
+            self.assertEqual(env["PATH"], "/usr/bin:/bin:/custom")
+            self.assertEqual(env["SHELL"], "/bin/fish")
+            self.assertEqual(env["TOKEN"], "secret-value")
+            self.assertNotIn("BAD-NAME", env)
 
     def test_ls_all_finds_stopped_folderless_vsc_but_not_stopped_plain_metadata(self):
         vsc = copy.deepcopy(self.dev)
@@ -274,7 +407,7 @@ class ContainerTests(unittest.TestCase):
     def test_docker_queries(self):
         def calls(argv, outputs):
             with patch.object(helper.subprocess, "run", side_effect=[done(out) for out in outputs]) as run, \
-                    patch.object(helper.os, "execvp"), redirect_stdout(io.StringIO()):
+                    patch.object(helper.os, "execvpe"), redirect_stdout(io.StringIO()):
                 try:
                     helper.main(argv)
                 except RuntimeError:
@@ -309,10 +442,10 @@ class ContainerTests(unittest.TestCase):
     def test_container_connect_argv(self):
         line = "printf 'hello'; echo $HOME"
         with patch.object(helper, "inspect", return_value=[self.plain]), \
-                patch.object(helper.os, "execvp") as execvp:
+                patch.object(helper.os, "execvpe") as execvpe:
             self.assertEqual(helper.main(["--container", "My Project", line]), 0)
-        execvp.assert_called_once_with("docker", ["docker", "exec", "-i", "-u", "builder",
-                                                   "My Project", "sh", "-c", line])
+        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "My Project", "builder", line),
+                                        dict(os.environ))
 
     def test_container_must_be_running(self):
         stopped = {**self.plain, "State": {"Status": "exited", "Running": False}}

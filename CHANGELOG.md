@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Terminals in containers start the user's login shell instead of `/bin/sh`.
+- Terminals in dev containers receive the config's `remoteEnv`, like VS Code.
+
 ## [0.1.0] - 2026-10-30
 
 ### Added
