@@ -133,7 +133,7 @@ Click a group header to collapse its rows while retaining the count. Click the C
 | Host core restart | Machines reconnect. |
 | Duplicate folder | The newest running container wins; the connector warns on stderr. |
 
-The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. The connector uses plain `docker exec -u USER`, so `remoteEnv` and `userEnvProbe` from `devcontainer.json` do not apply.
+The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's login shell and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
 
 ## For agents
 
