@@ -83,8 +83,8 @@ def agents(source):
                   '    list = [...pinned, ...rest, ...away];\n')
     source = once(source, '      const pic = icon(a.program, 16, t.foreground);\n',
                   '      const pic = icon(a.program, 16, disconnected(a) ? t.dim : t.foreground);\n')
-    source = once(source, '          .child(div().flex_none().max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))\n',
-                  '          .child(div().flex_none().max_w(full && more ? 120 : 200).truncate().text_color(disconnected(a) ? t.dim : idle ? t.muted : t.foreground).child(name))\n')
+    source = once(source, '.truncate().text_color(idle ? t.muted : t.foreground).child(name))\n',
+                  '.truncate().text_color(disconnected(a) ? t.dim : idle ? t.muted : t.foreground).child(name))\n')
     source = once(source, '        .child(this.status(t, a, byPriority && !isPinned));\n',
                   '        .child(this.status(t, disconnected(a) ? { status: "disconnected" } : a, byPriority && !isPinned));\n')
     source = once(source, '    // A group\'s header; it folds the group. Folded, it says how many and the most urgent state.\n',

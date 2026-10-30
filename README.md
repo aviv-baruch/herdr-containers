@@ -15,7 +15,7 @@ The screenshot is due before publication.
 
 ## Requirements
 
-- Herdr app 0.1.9 and its core (`hc`). The four cloned mods track this version.
+- Herdr app 0.1.10 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
 - Optional: the [Herdr Core Feature](requirements/feature/herdr-core/README.md) to preserve core state across dev container rebuilds.
