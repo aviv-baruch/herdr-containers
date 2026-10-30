@@ -4,7 +4,7 @@ const vm = require("node:vm");
 const test = require("node:test");
 const path = require("node:path");
 
-const source = fs.readFileSync(path.join(__dirname, "../app-mod/containers/main.js"), "utf8")
+const source = fs.readFileSync(path.join(__dirname, "../herdr-containers/mods/containers/main.js"), "utf8")
   .replace(/^import .*;\n/gm, "")
   .replace("export default class Containers", "class Containers") + "\nglobalThis.Containers = Containers;";
 
@@ -416,7 +416,7 @@ test("only the app's own spawn failure reads as a missing helper", async () => {
   a.setExec(async () => { throw new Error("cannot run hc-devcontainer: No such file or directory (os error 2)"); });
   a.view.refresh(a.cx);
   await settle();
-  assert.equal(a.view.error, "hc-devcontainer is not installed (run install.sh)");
+  assert.equal(a.view.error, "hc-devcontainer is not installed (put it on PATH)");
   const docker = "hc-devcontainer: cannot run docker: [Errno 2] No such file or directory: 'docker'";
   a.setExec(async () => ({ code: 1, stdout: "", stderr: `${docker}\n` }));
   a.view.refresh(a.cx);

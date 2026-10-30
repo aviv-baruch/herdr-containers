@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCHER = ROOT / "app-mod/patch-mods.py"
+PATCHER = ROOT / "tools/patch-mods.py"
 DEFAULTS = ROOT.parent / "herdr-app/defaults"
 CASES = (
     ("spaces", "spaces-containers", "mods/spaces", "  grouped(t, collapsed) {", 'shared("containers.down")'),
@@ -48,7 +48,7 @@ class PatchTests(unittest.TestCase):
                 if clone == "settings-containers":
                     self.assertIn("mods/settings-containers/${name}.svg", (target / "main.js").read_text())
 
-    def test_mangled_anchor_refuses_and_removes_clone(self):
+    def test_mangled_anchor_refuses_and_keeps_existing_clone(self):
         for original, clone, rel, anchor, result in CASES:
             reference = DEFAULTS / rel
             with self.subTest(clone=clone), tempfile.TemporaryDirectory(dir=ROOT / "test") as temp:
@@ -61,9 +61,12 @@ class PatchTests(unittest.TestCase):
                 target.mkdir()
                 (target / "old.txt").write_text("old clone")
                 run = self.run_patcher(source, target)
-                self.assertNotEqual(run.returncode, 0)
-                self.assertIn(f"Warning: {clone} clone unavailable", run.stderr)
-                self.assertFalse(target.exists())
+                self.assertEqual(run.returncode, 1)
+                self.assertTrue(run.stderr.startswith(f"patch-mods: {clone}: patch anchor matched 0 times: "), run.stderr)
+                self.assertIn(repr(anchor[:20])[1:-1], run.stderr)
+                self.assertNotIn("Traceback", run.stderr)
+                self.assertEqual([p.name for p in target.iterdir()], ["old.txt"])
+                self.assertEqual([p.name for p in Path(temp).iterdir() if p.name.startswith(".")], [])
 
 
 if __name__ == "__main__":

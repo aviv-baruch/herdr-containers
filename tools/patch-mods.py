@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Clone installed Herdr mods and apply small, anchored sidebar patches."""
+"""Clone Herdr mods and apply small, anchored sidebar patches."""
 
 import json
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -178,21 +177,27 @@ def clone(source, target, version):
         metadata.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         main = staged / "main.js"
         main.write_text(patch(main.read_text(encoding="utf-8")), encoding="utf-8")
+        old = Path(scratch) / "old"
         if target.exists():
-            target.rename(Path(scratch) / "old")
-        staged.rename(target)
+            target.rename(old)
+        try:
+            staged.rename(target)
+        except OSError:
+            if old.exists():
+                old.rename(target)
+            raise
 
 
 def main():
+    if len(sys.argv) != 4:
+        print("usage: patch-mods.py SOURCE TARGET 'herdr-app VERSION'", file=sys.stderr)
+        return 2
     source, target = map(Path, sys.argv[1:3])
     try:
-        version = sys.argv[3] if len(sys.argv) > 3 else subprocess.run(
-            ["herdr-app", "--version"], capture_output=True, text=True, check=True).stdout.strip()
-        clone(source, target, version)
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
-        if target.exists():
-            shutil.rmtree(target)
-        print(f"Warning: {target.name} clone unavailable ({error}); using shipped mod", file=sys.stderr)
+        clone(source, target, sys.argv[3])
+    except (OSError, ValueError, KeyError) as error:
+        # The target is only replaced after every patch applied, so it is left as it was.
+        print(f"patch-mods: {target.name}: {error}", file=sys.stderr)
         return 1
     return 0
 

@@ -1,0 +1,8 @@
+{
+  "place": "none",
+  "title": "Settings",
+  "cloned_from": {
+    "name": "frame-settings",
+    "version": "0.1.9"
+  }
+}

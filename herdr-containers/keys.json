@@ -1,0 +1,5 @@
+{
+  "layout:main-containers": {
+    "ctrl-shift-y": "containers.toggle"
+  }
+}

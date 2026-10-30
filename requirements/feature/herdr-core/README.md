@@ -2,7 +2,7 @@
 
 Install Herdr Core in a Linux dev container and persist its core identity in a named Docker volume across rebuilds.
 
-In a project beside this repository, copy `feature/herdr-core` into `.devcontainer/herdr-core`, then add:
+In a project beside this repository, copy `requirements/feature/herdr-core` into `.devcontainer/herdr-core`, then add:
 
 ```json
 {

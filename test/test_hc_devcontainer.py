@@ -13,8 +13,8 @@ import unittest
 from unittest.mock import patch
 from contextlib import redirect_stdout, redirect_stderr
 
-sys.dont_write_bytecode = True  # loading bin/hc-devcontainer would leave bin/__pycache__
-path = Path(__file__).resolve().parents[1] / "bin" / "hc-devcontainer"
+sys.dont_write_bytecode = True  # loading the helper would leave __pycache__
+path = Path(__file__).resolve().parents[1] / "requirements" / "hc-devcontainer"
 loader = importlib.machinery.SourceFileLoader("hc_devcontainer", str(path))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 helper = importlib.util.module_from_spec(spec)

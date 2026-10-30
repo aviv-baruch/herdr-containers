@@ -112,7 +112,7 @@ export default class Containers extends View {
       const message = String(e.message ?? e);
       // The app's own spawn failure (mods.rs run_blocking), not the helper's about docker.
       this.error = /^(Error: )?cannot run hc-devcontainer:/.test(message)
-        ? "hc-devcontainer is not installed (run install.sh)"
+        ? "hc-devcontainer is not installed (put it on PATH)"
         : /Cannot connect to the Docker daemon/i.test(message) ? "Docker isn't running" : message;
     }
     try {
