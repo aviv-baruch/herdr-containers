@@ -1,6 +1,6 @@
 # herdr-containers
 
-This repo is the Herdr layout package `herdr-containers` plus its requirements:
+This repo is the Herdr mod package `herdr-containers` plus its requirements:
 the `hc-devcontainer` host helper and an optional Herdr Core dev container
 Feature. It adds Containers to Herdr's main sidebar.
 
@@ -51,7 +51,7 @@ only hand-written mod; its tests are in `test/test_containers.cjs`.
 ## Testing
 
 Run `sh tools/check.sh` before proposing a commit. It runs Python and Node
-tests, syntax and JSON checks, the package drift test, and a whitespace check
+tests, syntax and JSON checks, the mod package drift test, and a whitespace check
 (`git diff --check` over tracked and untracked files). The drift test needs
 `../herdr-app/defaults`; CI fails if it is absent.
 
@@ -60,8 +60,9 @@ tests, syntax and JSON checks, the package drift test, and a whitespace check
 - To build from an installed app home (no `Cargo.toml`), pass its Herdr
   version: `python3 -I tools/build-package.py --source <app-home>
   --source-version X.Y.Z`.
-- The targeted Herdr version is the built `cloned_from`; README, RECIPE, and CI
-  must name the same one (`test/test_build_package.py` checks).
+- The targeted Herdr version comes from the four clones' `mod.json`
+  `cloned_from.version`; README, RECIPE, and CI must name the same one
+  (`test/test_build_package.py` checks).
 
 ## Updating for a new Herdr release
 
@@ -69,15 +70,17 @@ Read the new `herdr-app` defaults. Rebuild with
 `python3 -I tools/build-package.py --source <herdr-app>/defaults`. If an
 anchor fails, fix `tools/patch-mods.py`, then rebuild. Run `sh tools/check.sh`,
 compare the drift test, and live-verify all five mods and the sidebar in a
-scratch app home before release.
+scratch app home before release. Swapped clones are frozen copies: they miss
+later fixes to shipped mods until rebuilt and reinstalled.
 
 ## Releasing and publishing
 
-Publish as a public layout repo with topic `herdr-layout`. Keep
-`herdr-containers/RECIPE.md` current and add a real
-`herdr-containers/preview.png` before publishing. Update the changelog and
-versions with each release. Publishing and changes to the person's real app
-home require their explicit OK.
+Publish as a public mod repo with topic `herdr-mod` (`gh repo edit
+--remove-topic herdr-layout --add-topic herdr-mod`). Keep
+`herdr-containers/RECIPE.md` current and a real `herdr-containers/preview.png`.
+Ship the five mods and global `keys.json`, with no `layouts/` folder. Update
+the changelog and versions with each release. Publishing and changes to the
+person's real app home require their explicit OK.
 
 ## Contributing
 

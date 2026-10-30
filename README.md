@@ -1,6 +1,6 @@
 # Herdr Containers
 
-Add a Containers sidebar to Herdr's main workspace with dev container connections, recovery actions, and visibility settings.
+A Herdr mod that adds a Containers panel to the sidebar of the layout you already use: dev container connections, recovery actions, and visibility settings.
 
 ![Connecting two dev containers, running git status and curl inside them, folding the section](herdr-containers/demo.gif)
 
@@ -11,7 +11,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 - Adds **Dev containers**, **Other containers**, and **Gone** groups between Spaces and Agents, with counts on the group headers.
 - Opens running dev containers as spaces; offers Start for stopped ones and inline confirmation before connecting a plain container.
 - Keeps saved machines visible through Docker outages, and offers Repair, Disconnect, and Forget where appropriate.
-- Adds **Settings → Containers** visibility switches in the sidebar footer. Herdr's original layout remains available.
+- With optional swaps, adds **Settings → Containers** visibility switches in the sidebar footer.
 
 ## Requirements
 
@@ -24,44 +24,17 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 
 ### A. Ask an agent
 
-Once published, ask: **“Add herdr.dev/layouts/aviv-baruch/herdr-containers.”** Until then, point the agent at this repo's `herdr-containers/` folder. It should follow Herdr's “Layouts and mods other people made” steps, starting with the [recipe](herdr-containers/RECIPE.md) and every package file. It must disclose external access, avoid overwriting names, ask before replacing a used key, check each mod, and switch the layout.
+Give the agent this exact line:
+
+> Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/aviv-baruch/herdr-containers
+
+The agent should read the [recipe](herdr-containers/RECIPE.md) and package files, disclose external access, resolve name and key clashes, add the block to your current layout, and check each installed mod. Until the mod appears on herdr.dev, point it at this repo's `herdr-containers/` folder.
 
 ### B. Manual
 
-Read the [recipe](herdr-containers/RECIPE.md) and inspect the package files. Its mods run `hc`, `hc-devcontainer`, and `git`, inspect Docker containers and workspace files, and the cloned Settings reads and writes the app home's `settings.json`. Connecting or repairing a container runs `hc machine add … --install`. A container without a compatible Herdr Core (plain containers, and dev containers without the Feature) gets one at `~/.local/bin/herdr-core` of the user Herdr connects as, plus an `hc` link if it has none, and that core is restarted. hc copies its own binary when the container's OS and CPU match the host's; otherwise, as on any macOS host, it first downloads the matching build of its version from releases.herdr.dev. See the recipe for the full access list.
+Read the [recipe](herdr-containers/RECIPE.md) and inspect the five mods first. They run `hc`, `hc-devcontainer`, and `git`, inspect Docker containers and workspace files, and cloned Settings reads and writes the app home's `settings.json`. Connection or repair may install Herdr Core in the container or download a matching build from `releases.herdr.dev`. The recipe lists all external access.
 
-Herdr's app home is `$HERDR_APP_HOME`, else `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`. Check that `layouts/main-containers.json` and all five mod names are unused in that home. If any name is taken, rename the **new** layout or mod and every reference to it before copying; never overwrite an existing name. Then copy:
-
-```sh
-app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
-(
-  for source in herdr-containers/layouts/*.json herdr-containers/mods/*; do
-    case "$source" in
-      */layouts/*) target="$app_home/layouts/${source##*/}" ;;
-      *) target="$app_home/mods/${source##*/}" ;;
-    esac
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      printf 'Name clash: %s; nothing copied\n' "$target" >&2
-      exit 1
-    fi
-  done
-  mkdir -p "$app_home/layouts" "$app_home/mods"
-  cp herdr-containers/layouts/main-containers.json "$app_home/layouts/"
-  for mod in herdr-containers/mods/*; do cp -R "$mod" "$app_home/mods/"; done
-)
-```
-
-Merge `herdr-containers/keys.json` into the app home's `keys.json`, adding `layout:main-containers` and its `ctrl-shift-y` binding. Ask before replacing a key already in use. Do not copy the recipe, preview, or demo files into the app home. Check all five mods, then switch:
-
-```sh
-for name in containers spaces-containers agents-containers settings-containers workspace-chrome-containers; do
-  herdr-app check "$app_home/mods/$name"
-done
-herdr-app do layout.switch --name main-containers
-herdr-app status
-```
-
-Use the adjusted names in those commands if a clash required renaming. `herdr-app check` needs a display. To install the host helper:
+Install the helper from this repository on a PATH seen by both the app and core. Restart core if its PATH changed.
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -69,35 +42,64 @@ install -m 755 requirements/hc-devcontainer "$HOME/.local/bin/hc-devcontainer"
 hc-devcontainer ls --all --json
 ```
 
-Restart core if its PATH changed.
-
-### C. Add Containers to a layout you already use
-
-Keep your own layout and add only the Containers block. Install the host helper as in B, then copy the `containers` mod (same name-clash rule as above):
+Herdr's app home is `$HERDR_APP_HOME`, else `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`. Check for name clashes before copying. Rename a new mod and all its references if a name is taken; never overwrite an existing mod. The recipe's Watch out lists references inside code. From the repo root:
 
 ```sh
 app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
-test ! -e "$app_home/mods/containers" && cp -R herdr-containers/mods/containers "$app_home/mods/"
-herdr-app check "$app_home/mods/containers"
+(
+  for mod in herdr-containers/mods/*; do
+    target="$app_home/mods/${mod##*/}"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      printf 'Name clash: %s; nothing copied\n' "$target" >&2
+      exit 1
+    fi
+  done
+  mkdir -p "$app_home/mods"
+  for mod in herdr-containers/mods/*; do cp -R "$mod" "$app_home/mods/"; done
+)
 ```
 
-In `$app_home/layouts/<your-layout>.json`, add this block to a column, for example in your sidebar next to Spaces. Keep the id `containers`: the mod folds itself by resizing the block with that id.
+Add this block after Spaces in the `sidebar-lists` column of `$app_home/layouts/<your-layout>.json` (or another suitable column). Keep id `containers` even if you rename the mod: folding resizes that id. Use the renamed mod name in `content.mod` if needed.
 
 ```json
 { "id": "containers", "type": "block", "size": { "weight": 1 }, "min": 35, "content": { "mod": "containers" } }
 ```
 
-To fold it with a key, add `"layout:<your-layout>": { "ctrl-shift-y": "containers.toggle" }` to `keys.json`. Herdr reloads layouts when they change; otherwise run `herdr-app do layout.switch --name <your-layout>`.
+Merge [keys.json](herdr-containers/keys.json) into the app home's `keys.json`: add `"ctrl-shift-y": "containers.toggle"` under `"global"`. Ask before replacing a key already in use. If you renamed `containers`, use `<mod>.toggle`. The block also folds by clicking its header.
 
-The block works alone. The clones add the rest, and each one replaces a shipped mod in your layout. Copy the ones you want and change the block's `mod` to match:
+For full behavior, make these three edits to blocks in the same layout. The four clones are recommended; the `containers` mod works alone.
 
-| Clone | Replaces | Adds |
-|---|---|---|
-| `spaces-containers` | `spaces` | Disconnect removes the machine group at once; spaces in unreachable containers dim and say disconnected |
-| `agents-containers` | `agents` | A Disconnected group for agents in unreachable containers |
-| `workspace-chrome-containers` + `settings-containers` | the footer's `workspace-chrome` (keep `"props": { "footer": true }`) | Footer Settings opens a copy with the Containers visibility switches |
+| Block id | Change its `content.mod` from | To |
+| --- | --- | --- |
+| `spaces` | `spaces` | `spaces-containers` |
+| `agents` | `agents` | `agents-containers` |
+| `sidebar-footer` | `workspace-chrome` | `workspace-chrome-containers` |
 
-Without the Settings clones, plain containers and stopped dev containers both show. The clones are built from Herdr's shipped mods for the version in their `cloned_from`; if your layout uses older or customized versions of these mods, compare before swapping.
+In shipped `main`, those three blocks become:
+
+```json
+[
+  { "id": "spaces", "type": "block", "size": { "weight": 1 }, "min": 90,
+    "content": { "mod": "spaces-containers" } },
+  { "id": "agents", "type": "block", "size": { "weight": 1 }, "min": 90,
+    "content": { "mod": "agents-containers" } },
+  { "id": "sidebar-footer", "type": "block", "size": { "px": 69 },
+    "content": { "mod": "workspace-chrome-containers", "props": { "footer": true } } }
+]
+```
+
+Edit the existing blocks in place; their positions do not change. The footer opens the installed `settings-containers` mod. Keep its `"props": { "footer": true }`. Without the swaps, the shipped Spaces group can linger for 15 s after disconnect, unreachable spaces do not dim, Agents has no Disconnected group, and footer Settings has no Containers switches; both visibility options stay on. The swaps are copies of Herdr app 0.1.10's shipped mods, so compare before replacing an older or customized version. They need rebuilding and reinstalling to receive fixes from later Herdr releases.
+
+Check each installed mod and the app status. Herdr reloads layout edits live; no layout switch is needed. `herdr-app check` needs a display.
+
+```sh
+for name in containers spaces-containers agents-containers settings-containers workspace-chrome-containers; do
+  herdr-app check "$app_home/mods/$name"
+done
+herdr-app status
+```
+
+Use adjusted names if you renamed a mod. Leave `RECIPE.md`, `preview.png`, and `demo.*` out of the app home.
 
 ### Optional: the Herdr Core Feature
 
@@ -110,7 +112,7 @@ test ! -e "$project/.devcontainer/herdr-core" && test ! -L "$project/.devcontain
 cp -R requirements/feature/herdr-core "$project/.devcontainer/herdr-core"
 ```
 
-Add `"features": { "./herdr-core": { "version": "latest" } }` to that project's `devcontainer.json`, then rebuild. Its [README](requirements/feature/herdr-core/README.md) explains state and version handling.
+Add `"features": { "./herdr-core": { "version": "latest" } }` to that project's `devcontainer.json`, then rebuild. Its [README](requirements/feature/herdr-core/README.md) explains state and version handling. The Feature installs `curl` and `tar` with apt or apk if needed.
 
 ## Using it
 
@@ -133,23 +135,8 @@ Click a group header to collapse its rows while retaining the count. Click the C
 | Host core restart | Machines reconnect. |
 | Duplicate folder | The newest running container wins; the connector warns on stderr. |
 
-The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's login shell and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
+The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell) and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
 
 ## For agents
 
 Read [AGENTS.md](AGENTS.md). Task skills are in [`.agents/skills`](.agents/skills); `.claude/skills` points there.
-
-## Maintaining
-
-Run `sh tools/check.sh`. Its drift test compares a fresh build against the package using `../herdr-app/defaults`; CI requires that reference. For a new Herdr release, inspect its defaults, rebuild clones through the builder, repair failed anchors in `tools/patch-mods.py`, run the checks, and live-verify in a scratch app home:
-
-```sh
-python3 -I tools/build-package.py --source ../herdr-app/defaults
-sh tools/check.sh
-```
-
-The builder does not change `RECIPE.md` or `preview.png`. Update both as needed and bump the release version in the changelog. The Feature version is in `requirements/feature/herdr-core/devcontainer-feature.json`; the layout's `cloned_from` tracks Herdr.
-
-## License
-
-Apache-2.0. Copyright 2026 Aviv Baruch. See [LICENSE](LICENSE). SPDX-License-Identifier: Apache-2.0.
