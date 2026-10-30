@@ -1,6 +1,6 @@
 # Herdr Containers
 
-Add a Containers list to the sidebar of the Herdr layout you already use. Running dev containers open as spaces; saved connections remain visible during Docker outages, and an optional footer Settings swap adds visibility controls.
+A Containers panel for the sidebar of the layout you already use. It lists the Docker containers on this machine, with dev containers (made by the Dev Containers CLI or VS Code) apart from the rest. Click a running dev container and Herdr connects to it and opens a space in its workspace folder, so your terminals and agents run inside the container with its own shell and tools. Stopped containers offer Start, broken connections offer Repair, and saved connections stay listed while Docker is down. Four optional swaps of Herdr's Spaces, Agents, Settings and footer add instant disconnect, a Disconnected group for agents, and switches for what the panel shows. This is a piece you add to your current layout, not a whole window.
 
 ![Herdr Containers](preview.png)
 

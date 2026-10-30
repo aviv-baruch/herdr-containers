@@ -1,6 +1,6 @@
 # Herdr Containers
 
-A Herdr mod that adds a Containers panel to the sidebar of the layout you already use: dev container connections, recovery actions, and visibility settings.
+A Herdr mod that puts your Docker dev containers in the sidebar: click one and Herdr opens a space inside it, so your terminals and agents run in the container with its own shell and tools. It adds a Containers panel to the layout you already use, with Start, Repair, Disconnect and Forget, and keeps saved connections visible while Docker is down.
 
 ![Connecting two dev containers, running git status and curl inside them, folding the section](herdr-containers/demo.gif)
 
