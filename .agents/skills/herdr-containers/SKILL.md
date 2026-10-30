@@ -44,6 +44,9 @@ Follow Herdr's own steps for layouts other people made (herdr-app `defaults/AGEN
 5. `herdr-app check "$app_home/mods/<name>"` for each of the five mods, then
    `herdr-app do layout.switch --name main-containers`.
 
+To keep the person's own layout instead, follow README section C: copy only the `containers`
+mod, add its block (id `containers`) to their layout, and offer the clones as optional swaps.
+
 The clones (`*-containers`) are built for the Herdr version in their `cloned_from`. On a
 newer Herdr, rebuild them (maintainers: `update-for-herdr` skill) or from the recipe.
 

@@ -24,7 +24,7 @@ spec.loader.exec_module(builder)
 
 def files(folder):
     return {str(path.relative_to(folder)): path.read_bytes() for path in folder.rglob("*")
-            if path.is_file() and str(path.relative_to(folder)) not in {"RECIPE.md", "preview.png"}}
+            if path.is_file() and str(path.relative_to(folder)) not in {"RECIPE.md", "preview.png", "demo.mp4", "demo.gif"}}
 
 
 def app_home(temp):

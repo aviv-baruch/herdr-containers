@@ -2,9 +2,9 @@
 
 Add a Containers sidebar to Herdr's main workspace with dev container connections, recovery actions, and visibility settings.
 
-![herdr-containers](herdr-containers/preview.png)
+![Connecting two dev containers, running git status and curl inside them, folding the section](herdr-containers/demo.gif)
 
-The screenshot is due before publication.
+The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [preview.png](herdr-containers/preview.png).
 
 ## What it does
 
@@ -51,7 +51,7 @@ app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
 )
 ```
 
-Merge `herdr-containers/keys.json` into the app home's `keys.json`, adding `layout:main-containers` and its `ctrl-shift-y` binding. Ask before replacing a key already in use. Do not copy the recipe or preview into the app home. Check all five mods, then switch:
+Merge `herdr-containers/keys.json` into the app home's `keys.json`, adding `layout:main-containers` and its `ctrl-shift-y` binding. Ask before replacing a key already in use. Do not copy the recipe, preview, or demo files into the app home. Check all five mods, then switch:
 
 ```sh
 for name in containers spaces-containers agents-containers settings-containers workspace-chrome-containers; do
@@ -69,7 +69,39 @@ install -m 755 requirements/hc-devcontainer "$HOME/.local/bin/hc-devcontainer"
 hc-devcontainer ls --all --json
 ```
 
-Restart core if its PATH changed. For the optional Feature, from this repo root:
+Restart core if its PATH changed.
+
+### C. Add Containers to a layout you already use
+
+Keep your own layout and add only the Containers block. Install the host helper as in B, then copy the `containers` mod (same name-clash rule as above):
+
+```sh
+app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
+test ! -e "$app_home/mods/containers" && cp -R herdr-containers/mods/containers "$app_home/mods/"
+herdr-app check "$app_home/mods/containers"
+```
+
+In `$app_home/layouts/<your-layout>.json`, add this block to a column, for example in your sidebar next to Spaces. Keep the id `containers`: the mod folds itself by resizing the block with that id.
+
+```json
+{ "id": "containers", "type": "block", "size": { "weight": 1 }, "min": 35, "content": { "mod": "containers" } }
+```
+
+To fold it with a key, add `"layout:<your-layout>": { "ctrl-shift-y": "containers.toggle" }` to `keys.json`. Herdr reloads layouts when they change; otherwise run `herdr-app do layout.switch --name <your-layout>`.
+
+The block works alone. The clones add the rest, and each one replaces a shipped mod in your layout. Copy the ones you want and change the block's `mod` to match:
+
+| Clone | Replaces | Adds |
+|---|---|---|
+| `spaces-containers` | `spaces` | Disconnect removes the machine group at once; spaces in unreachable containers dim and say disconnected |
+| `agents-containers` | `agents` | A Disconnected group for agents in unreachable containers |
+| `workspace-chrome-containers` + `settings-containers` | the footer's `workspace-chrome` (keep `"props": { "footer": true }`) | Footer Settings opens a copy with the Containers visibility switches |
+
+Without the Settings clones, plain containers and stopped dev containers both show. The clones are built from Herdr's shipped mods for the version in their `cloned_from`; if your layout uses older or customized versions of these mods, compare before swapping.
+
+### Optional: the Herdr Core Feature
+
+For the optional Feature, from this repo root:
 
 ```sh
 project=/path/to/project
