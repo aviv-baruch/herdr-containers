@@ -1,4 +1,4 @@
-# herdr-devcontainer
+# herdr-containers
 
 This repo is the Herdr layout package `herdr-containers` plus its requirements:
 the `hc-devcontainer` host helper and an optional Herdr Core dev container

@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: herdr-devcontainer
+          path: herdr-containers
       - uses: actions/checkout@v4
         with:
           repository: herdrdev/herdr-app
@@ -27,5 +27,5 @@ jobs:
         with:
           node-version: '22'
       - name: Check package
-        working-directory: herdr-devcontainer
+        working-directory: herdr-containers
         run: sh tools/check.sh
