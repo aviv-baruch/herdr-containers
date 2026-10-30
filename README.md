@@ -1,20 +1,92 @@
-# Herdr dev containers
+# Herdr Containers
 
-Native Herdr machine support for running Docker containers. This repository adds a [Dev Container Feature](feature/herdr-core/README.md), a host side `--via` connector, and a personal Herdr sidebar. It changes neither herdr-core nor herdr-app.
+Add a Containers sidebar to Herdr's main workspace with dev container connections, recovery actions, and visibility settings.
 
-The Feature closes two rebuild gaps: the container always has `herdr-core` on PATH, and its core state (including the permanent identity) lives in a named volume. A host machine connection then reconnects after a rebuild instead of seeing a missing or different core. Herdr carries agent status from that core to the desktop as usual.
+![herdr-containers](herdr-containers/preview.png)
 
-## Setup
+The screenshot is due before publication.
 
-1. Copy `feature/herdr-core` to your project's `.devcontainer/herdr-core`, add `"features": { "./herdr-core": { "version": "latest" } }` to its `devcontainer.json`, then rebuild. The Feature supports Linux x86_64 and aarch64. The included [test fixture](test/.devcontainer/devcontainer.json) can be prepared with `test/sync-feature.sh`.
-2. On the Docker host, start Herdr once so its shipped `layouts/main.json`, mods, frame settings, and `keys.json` exist, then run `./install.sh`. It installs `hc-devcontainer` in `~/.local/bin`, the personal `containers` mod, and patched clones of Spaces, Agents, Settings, and the workspace footer under `~/.config/herdr-app/mods` (or the configured app home). It creates `layouts/main-containers.json` from the installed main layout. When a display is available it checks each clone and falls back to its shipped mod if the clone fails. It switches a running app immediately; when the app is closed, it selects the layout for next launch. An existing personal layout is preserved; `./install.sh --force` regenerates it and keeps the old file as `main-containers.json.old-<time>`.
-3. In the **Containers** sidebar section, click a running dev container to connect it and open a space. Click a plain container, then **Connect** after reading the inline note: connecting copies `herdr-core` into that container. Click the row again or **Cancel** to close the note. If a space is already open on its machine, a click selects that space. The original **Add machine** SSH dialog remains available in Herdr.
+## What it does
 
-Click the **Containers** header or press `Ctrl+Shift+Y` to collapse or expand the section; dragging its divider down to the minimum collapses it too. Collapsed, only the header shows. The **Dev containers**, **Other containers** and **Gone** groups show their counts. The sidebar footer's **Settings** opens a screen with a **Containers** section for showing or hiding plain containers and stopped dev containers. These choices survive restarts. Palette and keyboard **Settings** still open Herdr's original screen, without the Containers section. The installer binds `Ctrl+Shift+Y` in the `main-containers` layout only, so other layouts keep the key; it migrates an existing `layout.toggle:containers` or global binding, but leaves unrelated bindings alone. If an older install left the section hidden, rerun `./install.sh` while Herdr is open to show it again. The list refreshes every 5 s while it shows and the window is active.
+- Adds **Dev containers**, **Other containers**, and **Gone** groups between Spaces and Agents, with counts on the group headers.
+- Opens running dev containers as spaces; offers Start for stopped ones and inline confirmation before connecting a plain container.
+- Keeps saved machines visible through Docker outages, and offers Repair, Disconnect, and Forget where appropriate.
+- Adds **Settings → Containers** visibility switches in the sidebar footer. Herdr's original layout remains available.
 
-Run `hc-devcontainer ls --all --json` to see running and paused containers and stopped dev containers, including their state, Feature presence, workspace, and exact `--via` command. `hc-devcontainer ls --json` lists running dev containers only. A dev container has a `devcontainer.local_folder` or `vsch.local.folder` label and connects by folder; if several have that folder, the connector uses the newest and warns on stderr. Folders compare as real paths, so a label reached through a symlink still connects. A folderless container with `devcontainer.metadata` and a `vsc-*` image is also a dev container; it connects by name with the metadata user. A plain container, including `docker run mcr.microsoft.com/devcontainers/base` with metadata, stays plain and connects by name with `hc-devcontainer --container NAME LINE`. `hc-devcontainer exists VIA` exits 0 when the via's container exists, 1 when it is gone, 2 on an error. `HC_DEVCONTAINER_DOCKER` selects a different Docker compatible binary.
+## Requirements
 
-## Behavior
+- Herdr app 0.1.9 and its core (`hc`). The four cloned mods track this version.
+- `requirements/hc-devcontainer` on the PATH seen by both app and core.
+- Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
+- Optional: the [Herdr Core Feature](requirements/feature/herdr-core/README.md) to preserve core state across dev container rebuilds.
+
+## Install
+
+### A. Ask an agent
+
+Once published, ask: **“Add herdr.dev/layouts/aviv-baruch/herdr-containers.”** Until then, point the agent at this repo's `herdr-containers/` folder. It should follow Herdr's “Layouts and mods other people made” steps, starting with the [recipe](herdr-containers/RECIPE.md) and every package file. It must disclose external access, avoid overwriting names, ask before replacing a used key, check each mod, and switch the layout.
+
+### B. Manual
+
+Read the [recipe](herdr-containers/RECIPE.md) and inspect the package files. Its mods run `hc`, `hc-devcontainer`, and `git`, inspect Docker containers and workspace files, and the cloned Settings reads and writes the app home's `settings.json`. Connecting or repairing a container runs `hc machine add … --install`. A container without a compatible Herdr Core (plain containers, and dev containers without the Feature) gets one at `~/.local/bin/herdr-core` of the user Herdr connects as, plus an `hc` link if it has none, and that core is restarted. hc copies its own binary when the container's OS and CPU match the host's; otherwise, as on any macOS host, it first downloads the matching build of its version from releases.herdr.dev. See the recipe for the full access list.
+
+Herdr's app home is `$HERDR_APP_HOME`, else `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`. Check that `layouts/main-containers.json` and all five mod names are unused in that home. If any name is taken, rename the **new** layout or mod and every reference to it before copying; never overwrite an existing name. Then copy:
+
+```sh
+app_home=${HERDR_APP_HOME:-"${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app"}
+(
+  for source in herdr-containers/layouts/*.json herdr-containers/mods/*; do
+    case "$source" in
+      */layouts/*) target="$app_home/layouts/${source##*/}" ;;
+      *) target="$app_home/mods/${source##*/}" ;;
+    esac
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      printf 'Name clash: %s; nothing copied\n' "$target" >&2
+      exit 1
+    fi
+  done
+  mkdir -p "$app_home/layouts" "$app_home/mods"
+  cp herdr-containers/layouts/main-containers.json "$app_home/layouts/"
+  for mod in herdr-containers/mods/*; do cp -R "$mod" "$app_home/mods/"; done
+)
+```
+
+Merge `herdr-containers/keys.json` into the app home's `keys.json`, adding `layout:main-containers` and its `ctrl-shift-y` binding. Ask before replacing a key already in use. Do not copy the recipe or preview into the app home. Check all five mods, then switch:
+
+```sh
+for name in containers spaces-containers agents-containers settings-containers workspace-chrome-containers; do
+  herdr-app check "$app_home/mods/$name"
+done
+herdr-app do layout.switch --name main-containers
+herdr-app status
+```
+
+Use the adjusted names in those commands if a clash required renaming. `herdr-app check` needs a display. To install the host helper:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 requirements/hc-devcontainer "$HOME/.local/bin/hc-devcontainer"
+hc-devcontainer ls --all --json
+```
+
+Restart core if its PATH changed. For the optional Feature, from this repo root:
+
+```sh
+project=/path/to/project
+mkdir -p "$project/.devcontainer"
+test ! -e "$project/.devcontainer/herdr-core" && test ! -L "$project/.devcontainer/herdr-core"
+cp -R requirements/feature/herdr-core "$project/.devcontainer/herdr-core"
+```
+
+Add `"features": { "./herdr-core": { "version": "latest" } }` to that project's `devcontainer.json`, then rebuild. Its [README](requirements/feature/herdr-core/README.md) explains state and version handling.
+
+## Using it
+
+Click a running dev container to connect and open its workspace. A stopped dev container offers **Start**; a plain container asks for **Connect** inline. **Repair** reconnects a rebuilt unreachable machine. **Gone → Forget** removes a saved machine whose container has disappeared. **× → Disconnect** closes its spaces and removes the machine while the container keeps running.
+
+Click a group header to collapse its rows while retaining the count. Click the Containers header, or press **Ctrl+Shift+Y**, to fold the whole block. The sidebar footer's **Settings → Containers** controls visibility; palette and keyboard Settings open Herdr's original settings screen. The list refreshes every 5 seconds while open and active.
+
+## Behavior and resilience
 
 | Case | Behavior |
 | --- | --- |
@@ -29,22 +101,23 @@ Run `hc-devcontainer ls --all --json` to see running and paused containers and s
 | Host core restart | Machines reconnect. |
 | Duplicate folder | The newest running container wins; the connector warns on stderr. |
 
-The workspace follows the closest bind mount containing the local folder, including a subfolder below a mounted git root. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space's folder unset. Herdr then asks the remote core to start terminals in that user's `HOME`. If `HOME` is unset in the container, the core falls back to its current directory, which can be `/`. The connector does not guess a home from the Docker image's environment because it may belong to a different user. It runs a plain `docker exec -u USER`, so `remoteEnv` and `userEnvProbe` from `devcontainer.json` do not apply to the core and its terminals.
+The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. The connector uses plain `docker exec -u USER`, so `remoteEnv` and `userEnvProbe` from `devcontainer.json` do not apply.
 
-Ensure `~/.local/bin` is on the app and core's `PATH`, then restart a running core if its environment predates that change. If the core cannot find `hc-devcontainer`, its shell exits 127 and `hc machine add` may report **"hc is not installed"**; so does a container without `sh` (a distroless image), where installing cannot help. The sidebar itself reports **"hc-devcontainer is not installed (run install.sh)"** when the app cannot find the helper.
+## For agents
 
-## App integration
+Read [AGENTS.md](AGENTS.md). Task skills are in [`.agents/skills`](.agents/skills); `.claude/skills` points there.
 
-Herdr replaces shipped layouts and mods on start. The installer leaves them intact and creates a personal `main-containers` layout, with a `containers` block between the Spaces and Agents lists. The block uses the personal `containers` mod. The layout records its source and app version in `cloned_from`, as a `layout.clone` would, but it starts with the shipped sizes rather than copying the main layout's sidebar width and other clicks. It is generated from the installed `main.json`, so rerunning with `--force` picks up a newer shipped layout; local changes in `main-containers.json` are otherwise kept, including a lower block minimum or a Spaces block pointed at another mod.
+## Maintaining
 
-Shipped Spaces caches `hc machine ls` for 15 seconds. The `spaces-containers` clone hides machines being removed, refreshes the cache when removal or connectivity changes, and shows disconnected groups immediately. The `agents-containers` clone moves disconnected agents to their own group and dims their status. The `settings-containers` clone copies the installed frame settings screen and adds the two Containers toggles. The `workspace-chrome-containers` clone changes only the sidebar footer Settings action; the brand block still uses shipped `workspace-chrome`. The installer rebuilds each clone from its installed source on every run. If an anchor or check fails, it removes that clone, warns, and points its layout block back to the shipped mod. A Settings clone failure also leaves the footer on shipped `workspace-chrome`. Re-run `install.sh` after Herdr updates so the clones track the new shipped versions.
+Run `sh tools/check.sh`. Its drift test compares a fresh build against the package using `../herdr-app/defaults`; CI requires that reference. For a new Herdr release, inspect its defaults, rebuild clones through the builder, repair failed anchors in `tools/patch-mods.py`, run the checks, and live-verify in a scratch app home:
 
-The Feature is suitable for upstreaming. The connector's `--via` part (folder or `--container` to `docker exec`) would fit herdr-core's `docs/via` examples once split from the sidebar's discovery commands (`ls`, `start`, `exists`). The sidebar is a personal add-on.
+```sh
+python3 -I tools/build-package.py --source ../herdr-app/defaults
+sh tools/check.sh
+```
 
-## State
+The builder does not change `RECIPE.md` or `preview.png`. Update both as needed and bump the release version in the changelog. The Feature version is in `requirements/feature/herdr-core/devcontainer-feature.json`; the layout's `cloned_from` tracks Herdr.
 
-The Feature's `${devcontainerId}` volume is mounted at `/var/lib/herdr-core-state`. The remote user's `~/.local/state/herdr-core` points there. Herdr's `paths.rs` appends the session below this path; Unix `private_dir` creates the session directory through the symlink, with mode 0700. The mount directory itself is world-writable and sticky, so a UID the devcontainers CLI remapped after the build can still create it. This keeps the core's standard path and avoids setting `XDG_STATE_HOME` for every program. Keep the volume to keep the core identity. If a dev container already has nonempty state at that path, move it before adding the Feature.
+## License
 
-The core id also depends on `/etc/machine-id`: herdr-core treats a changed machine id as a cloned disk and starts a new identity. Images without one (such as the devcontainers base images) or with one that stays the same across builds keep their id; an image whose build writes a fresh one (installing systemd does) gets a new core id on every rebuild, and Herdr then sees a different core. The Feature warns at build time when the image has a machine id.
-
-The Feature installs the binary at the remote user's `~/.local/bin/herdr-core`, the file `hc machine update` replaces, and links `/usr/local/bin/herdr-core` to it. An update therefore survives container restarts; a rebuild installs the Feature's version again. `latest` is resolved when the image builds and Docker caches that layer, so pin `version` or rebuild without the cache to move it.
+Apache-2.0. Copyright 2026 Aviv Baruch. See [LICENSE](LICENSE). SPDX-License-Identifier: Apache-2.0.
