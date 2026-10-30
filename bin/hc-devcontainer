@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""List Docker containers and run a herdr-core connection line in one."""
+
+import argparse
+import json
+import os
+import posixpath
+import re
+import shlex
+import subprocess
+import sys
+
+FOLDER_LABELS = ("devcontainer.local_folder", "vsch.local.folder")
+
+
+def metadata(raw):
+    try:
+        entries = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if isinstance(entries, dict):
+        entries = [entries]
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+def metadata_user(raw):
+    remote = container = None
+    for entry in metadata(raw):
+        if isinstance(entry.get("remoteUser"), str) and entry["remoteUser"]:
+            remote = entry["remoteUser"]
+        if isinstance(entry.get("containerUser"), str) and entry["containerUser"]:
+            container = entry["containerUser"]
+    return remote or container
+
+
+def metadata_has_feature(raw):
+    # ghcr.io/o/r/herdr-core:1, ./herdr-core, …/herdr-core@sha256:…
+    return any(re.split(r"[:@]", str(entry.get("id", "")).rsplit("/", 1)[-1])[0] == "herdr-core"
+               for entry in metadata(raw))
+
+
+def machine_name(folder):
+    raw = os.path.basename(folder.rstrip(os.sep))
+    ascii_lower = "".join(c.lower() if c.isascii() else "-" for c in raw)
+    name = "".join(c if c.isalnum() or c in "-_." else "-"
+                   for c in ascii_lower).lstrip("-_.")[:32]
+    # Not "local": shipped Spaces ids its own machine group machine-local.
+    if not name or re.fullmatch(r"t[1-9][0123456789bcdfghjkmnpqrstvwxyz]*", name):
+        return "container"
+    return name
+
+
+def exec_argv(docker, container_id, user, line):
+    return [docker, "exec", "-i", *(["-u", user] if user else []),
+            container_id, "sh", "-c", line]
+
+
+def shell_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def same_folder(a, b):
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def workspace_for(folder, mounts, working_dir):
+    best = None
+    if folder:
+        folder = os.path.realpath(folder)
+        for mount in mounts:
+            if mount.get("Type", "bind") != "bind":
+                continue
+            source, dest = mount.get("Source"), mount.get("Destination")
+            if not source or not dest:
+                continue
+            source = os.path.realpath(source)
+            try:
+                if os.path.commonpath([folder, source]) != source:
+                    continue
+            except ValueError:
+                continue
+            if best is None or len(source) > len(best[0]):
+                best = (source, dest)
+    if best:
+        source, dest = best
+        relative = os.path.relpath(folder, source)
+        return posixpath.normpath(posixpath.join(dest, relative))
+    return working_dir if working_dir and working_dir != "/" else ""
+
+
+def run(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise RuntimeError(f"cannot run {argv[0]}: {error}") from error
+    if result.returncode:
+        raise RuntimeError((result.stderr or f"{argv[0]} {argv[1]} failed").strip())
+    return result.stdout
+
+
+def ps(docker, *extra):
+    return run([docker, "ps", "-q", *extra]).split()
+
+
+def folder_ids(docker, *extra):
+    return [i for label in FOLDER_LABELS for i in ps(docker, *extra, "--filter", f"label={label}")]
+
+
+def inspect(docker, ids):
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return []
+    output = run([docker, "inspect", "--type", "container", *ids])
+    try:
+        return json.loads(output)
+    except ValueError as error:
+        raise RuntimeError(f"invalid {docker} inspect output: {error}") from error
+
+
+def rows(containers):
+    found = []
+    for item in containers:
+        docker_state = item.get("State") or {}
+        state = docker_state.get("Status") or ("running" if docker_state.get("Running", True) else "exited")
+        config = item.get("Config") or {}
+        labels = config.get("Labels") or {}
+        folder = labels.get("devcontainer.local_folder") or labels.get("vsch.local.folder") or ""
+        raw = labels.get("devcontainer.metadata")
+        # Folderless CLI builds use vsc-* images; metadata on other images alone is insufficient.
+        devcontainer = bool(folder or ("devcontainer.metadata" in labels and re.fullmatch(r"vsc-.+", config.get("Image") or "")))
+        name = item.get("Name", "").lstrip("/")
+        found.append({
+            "folder": folder,
+            "name": name,
+            "id": item["Id"],
+            "kind": "devcontainer" if devcontainer else "container",
+            "state": state,
+            "has_feature": devcontainer and metadata_has_feature(raw),
+            "workspace": workspace_for(folder, item.get("Mounts") or [], config.get("WorkingDir")),
+            "user": metadata_user(raw) or config.get("User") or None,
+            "image": config.get("Image", ""),
+            "via": f"hc-devcontainer {shell_quote(folder)}" if folder else f"hc-devcontainer --container {shell_quote(name)}",
+            "suggested_name": machine_name(folder if folder else name),
+            "created": item.get("Created", ""),
+        })
+    found.sort(key=lambda row: (row["kind"] != "devcontainer", row["folder"], row["name"]))
+    seen = set()
+    for row in found:
+        base = row["suggested_name"]
+        name = base
+        suffix = 2
+        while name in seen:
+            tail = f"-{suffix}"
+            name = f"{base[:32 - len(tail)]}{tail}"
+            suffix += 1
+        row["suggested_name"] = name
+        seen.add(name)
+    return found
+
+
+def exists(docker, via):
+    """0: the via's container exists (any state), 1: it is gone; errors raise."""
+    parts = shlex.split(via)
+    if parts[:1] != ["hc-devcontainer"] or len(parts) != (3 if parts[1:2] == ["--container"] else 2):
+        raise ValueError(f"not an hc-devcontainer via: {via!r}")
+    if len(parts) == 2:
+        found = [row for row in rows(inspect(docker, folder_ids(docker, "-a"))) if same_folder(row["folder"], parts[1])]
+        return 0 if found else 1
+    try:
+        inspect(docker, [parts[2]])
+    except RuntimeError as error:
+        if "no such" in str(error).lower():  # docker: No such object/container; podman: no such container
+            return 1
+        raise
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    docker = os.environ.get("HC_DEVCONTAINER_DOCKER") or "docker"
+    if argv and argv[0] == "ls":
+        parser = argparse.ArgumentParser(prog="hc-devcontainer ls")
+        parser.add_argument("--all", action="store_true")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(argv[1:])
+        # Running and paused containers, and with --all stopped dev ones too.
+        ids = ps(docker) + (folder_ids(docker, "-a") + ps(docker, "-a", "--filter", "label=devcontainer.metadata") if args.all else [])
+        found = rows(inspect(docker, ids))
+        if args.all:
+            found = [row for row in found if row["kind"] == "devcontainer" or row["state"] in ("running", "paused")]
+        if not args.all:
+            found = [row for row in found if row["kind"] == "devcontainer" and row["state"] == "running"]
+        if args.json:
+            for row in found:
+                row.pop("created")
+            print(json.dumps(found))
+        else:
+            for row in found:
+                print(f"{row['suggested_name']}\t{row['folder']}\t{row['name']}\t{row['id']}")
+        return 0
+
+    if argv and argv[0] == "start":
+        parser = argparse.ArgumentParser(prog="hc-devcontainer start")
+        parser.add_argument("id")
+        args = parser.parse_args(argv[1:])
+        run([docker, "start", args.id])
+        return 0
+
+    if argv and argv[0] == "exists":
+        parser = argparse.ArgumentParser(prog="hc-devcontainer exists",
+                                         description="Exit 0 if the container exists, 1 if gone, 2 on error.")
+        parser.add_argument("via")
+        args = parser.parse_args(argv[1:])
+        try:
+            return exists(docker, args.via)
+        except (RuntimeError, ValueError) as error:
+            print(f"hc-devcontainer: {error}", file=sys.stderr)
+            return 2
+
+    parser = argparse.ArgumentParser(prog="hc-devcontainer")
+    parser.add_argument("--container", metavar="NAME")
+    parser.add_argument("args", nargs="+")
+    args = parser.parse_args(argv)
+    if args.container:
+        if len(args.args) != 1:
+            parser.error("--container needs a name and one connection line")
+        found = [row for row in rows(inspect(docker, [args.container])) if row["state"] == "running"]
+        if not found:
+            raise RuntimeError(f"container {args.container!r} is not running")
+        os.execvp(docker, exec_argv(docker, found[0]["name"], found[0]["user"], args.args[0]))
+        return 0
+    if len(args.args) != 2:
+        parser.error("expected <folder> <line>, or --container NAME <line>")
+    folder, line = args.args
+    # ls prints the label as Docker has it; compare real paths so symlinks and slashes match.
+    found = [row for row in rows(inspect(docker, folder_ids(docker)))
+             if row["state"] == "running" and same_folder(row["folder"], folder)]
+    if not found:
+        raise RuntimeError(f"no running dev container found for {folder}")
+    found.sort(key=lambda row: row["created"], reverse=True)
+    if len(found) > 1:
+        print(f"hc-devcontainer: {len(found)} containers match; using newest {found[0]['id']}", file=sys.stderr)
+    os.execvp(docker, exec_argv(docker, found[0]["id"], found[0]["user"], line))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"hc-devcontainer: {error}", file=sys.stderr)
+        sys.exit(1)

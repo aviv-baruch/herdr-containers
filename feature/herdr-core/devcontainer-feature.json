@@ -1,0 +1,21 @@
+{
+  "id": "herdr-core",
+  "version": "1.1.0",
+  "name": "Herdr Core",
+  "description": "Install herdr-core and keep its identity across dev container rebuilds.",
+  "installsAfter": ["ghcr.io/devcontainers/features/common-utils"],
+  "options": {
+    "version": {
+      "type": "string",
+      "default": "latest",
+      "description": "Herdr Core release version."
+    }
+  },
+  "mounts": [
+    {
+      "source": "herdr-core-state-${devcontainerId}",
+      "target": "/var/lib/herdr-core-state",
+      "type": "volume"
+    }
+  ]
+}

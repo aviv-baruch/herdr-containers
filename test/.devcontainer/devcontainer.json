@@ -1,0 +1,8 @@
+{
+  "name": "Herdr Core Feature Test",
+  "image": "mcr.microsoft.com/devcontainers/base:bookworm",
+  "remoteUser": "vscode",
+  "features": {
+    "./herdr-core": { "version": "latest" }
+  }
+}
