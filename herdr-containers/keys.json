@@ -1,5 +1,5 @@
 {
-  "layout:main-containers": {
+  "global": {
     "ctrl-shift-y": "containers.toggle"
   }
 }

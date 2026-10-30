@@ -14,10 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Clones rebuilt for Herdr 0.1.10.
+- Published as a herdr.dev mod with topic `herdr-mod`; removed the
+  `main-containers` layout.
+- Ctrl+Shift+Y is now a global binding.
 
 ### Fixed
 
-- Terminals in containers start the user's login shell instead of `/bin/sh`.
+- Terminals in containers start the user's passwd shell interactively instead
+  of always using `/bin/sh`.
 - Terminals in dev containers receive the config's `remoteEnv`, like VS Code.
 
 ## [0.1.0] - 2026-10-30

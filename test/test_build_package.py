@@ -15,11 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT.parent / "herdr-app/defaults"
 PACKAGE = ROOT / "herdr-containers"
 BUILDER = ROOT / "tools/build-package.py"
-READY = (SOURCE / "layouts/main.json").is_file() and (SOURCE.parent / "Cargo.toml").is_file()
 
 spec = importlib.util.spec_from_file_location("build_package", BUILDER)
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
+READY = (SOURCE.parent / "Cargo.toml").is_file() and all(
+    (SOURCE / relative).is_dir() for relative, _ in builder.CLONES
+)
 
 
 def files(folder):
@@ -29,8 +31,7 @@ def files(folder):
 
 def app_home(temp):
     home = Path(temp) / "app-home"
-    (home / "layouts").mkdir(parents=True)
-    shutil.copy2(SOURCE / "layouts/main.json", home / "layouts/main.json")
+    home.mkdir()
     for relative, _ in builder.CLONES:
         shutil.copytree(SOURCE / relative, home / relative)
     return home
@@ -40,26 +41,10 @@ class BuildPackageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not READY:
-            message = f"needs Herdr defaults and Cargo.toml at {SOURCE}"
+            message = f"needs Herdr mods and Cargo.toml at {SOURCE}"
             if os.environ.get("CI"):
                 raise AssertionError(message)
             raise unittest.SkipTest(message)
-
-    def test_layout_order_references_and_source_version(self):
-        version = builder.source_version(SOURCE, None)
-        main = json.loads((SOURCE / "layouts/main.json").read_text())
-        built = builder.layout_from(SOURCE, version)
-        lists = builder.find(built, "sidebar-lists")["children"]
-        self.assertEqual([item["id"] for item in lists], ["spaces", "containers", "agents"])
-        self.assertEqual([(item["content"]["mod"]) for item in lists],
-                         ["spaces-containers", "containers", "agents-containers"])
-        self.assertEqual(lists[1]["size"], {"weight": 1})
-        self.assertEqual(lists[1]["min"], 35)
-        self.assertEqual(builder.find(built, "sidebar-footer")["content"]["mod"],
-                         "workspace-chrome-containers")
-        self.assertEqual(builder.find(built, "brand")["content"]["mod"], "workspace-chrome")
-        self.assertEqual(built["cloned_from"], {"name": "main", "version": version})
-        self.assertEqual(builder.find(main, "brand"), builder.find(built, "brand"))
 
     def test_generated_package_has_no_drift_and_keeps_recipe(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "test") as temp:
@@ -72,6 +57,9 @@ class BuildPackageTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((generated / "RECIPE.md").read_text(), "keep recipe")
             self.assertEqual((generated / "preview.png").read_bytes(), b"keep preview")
+            self.assertFalse((generated / "layouts").exists())
+            self.assertEqual(json.loads((generated / "keys.json").read_text()),
+                             {"global": {"ctrl-shift-y": "containers.toggle"}})
             self.assertEqual(files(generated), files(PACKAGE))
 
     def test_installed_app_home_with_source_version(self):
@@ -83,8 +71,8 @@ class BuildPackageTests(unittest.TestCase):
                                      "--source-version", version, "--output", str(output)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((output / "layouts/main-containers.json").read_bytes(),
-                             (PACKAGE / "layouts/main-containers.json").read_bytes())
+            self.assertFalse((output / "layouts").exists())
+            self.assertEqual((output / "keys.json").read_bytes(), (PACKAGE / "keys.json").read_bytes())
             for _, name in builder.CLONES:
                 self.assertEqual((output / "mods" / name / "mod.json").read_bytes(),
                                  (PACKAGE / "mods" / name / "mod.json").read_bytes())
@@ -111,16 +99,16 @@ class BuildPackageTests(unittest.TestCase):
 
 
 class TargetVersionTests(unittest.TestCase):
-    # The builder writes cloned_from; docs and CI must name the same Herdr.
+    # The builder writes cloned_from on each clone; docs and CI must agree.
     def test_docs_and_ci_name_the_built_herdr_version(self):
-        layout = json.loads((PACKAGE / "layouts/main-containers.json").read_text())
-        version = layout["cloned_from"]["version"]
+        versions = set()
         for _, name in builder.CLONES:
             meta = json.loads((PACKAGE / "mods" / name / "mod.json").read_text())
-            self.assertEqual(meta["cloned_from"]["version"], version, name)
+            versions.add(meta["cloned_from"]["version"])
+        self.assertEqual(len(versions), 1)
+        version = versions.pop()
         mention = re.compile(r"\b(?:Herdr(?: app)?|herdr-app) v?(\d+\.\d+\.\d+)")
-        docs = [ROOT / "README.md", ROOT / "AGENTS.md", PACKAGE / "RECIPE.md",
-                *sorted((ROOT / ".agents/skills").glob("*/SKILL.md"))]
+        docs = [ROOT / "README.md", ROOT / "AGENTS.md", PACKAGE / "RECIPE.md"]
         for path in docs:
             for found in mention.findall(path.read_text(encoding="utf-8")):
                 self.assertEqual(found, version, path.relative_to(ROOT))

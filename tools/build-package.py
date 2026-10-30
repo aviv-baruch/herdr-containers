@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the shareable layout from one Herdr app source."""
+"""Build the shareable mod from one Herdr app source."""
 
 import argparse
 import json
@@ -37,59 +37,15 @@ def source_version(source, supplied):
     return version
 
 
-def find(node, wanted):
-    if node.get("id") == wanted:
-        return node
-    for child in node.get("children", []):
-        found = find(child, wanted)
-        if found is not None:
-            return found
-    return None
-
-
-def layout_from(source, version):
-    tree = json.loads((source / "layouts/main.json").read_text(encoding="utf-8"))
-    lists = find(tree, "sidebar-lists")
-    if lists is None:
-        raise ValueError("main layout has no sidebar-lists")
-    children = lists["children"]
-    positions = [i for i, block in enumerate(children) if block.get("id") == "spaces"]
-    if len(positions) != 1 or positions[0] + 1 >= len(children) or children[positions[0] + 1].get("id") != "agents":
-        raise ValueError("main layout no longer has adjacent spaces and agents blocks")
-    i = positions[0]
-    for block, original, replacement in (
-        (children[i], "spaces", "spaces-containers"),
-        (children[i + 1], "agents", "agents-containers"),
-    ):
-        if block.get("content", {}).get("mod") != original:
-            raise ValueError(f"{block['id']} no longer uses {original}")
-        block["content"]["mod"] = replacement
-    children.insert(i + 1, {
-        "id": "containers", "type": "block", "size": {"weight": 1}, "min": 35,
-        "content": {"mod": "containers"},
-    })
-    footer = find(tree, "sidebar-footer")
-    brand = find(tree, "brand")
-    if footer is None or footer.get("content", {}).get("mod") != "workspace-chrome":
-        raise ValueError("main layout footer no longer uses workspace-chrome")
-    if brand is None or brand.get("content", {}).get("mod") != "workspace-chrome":
-        raise ValueError("main layout brand no longer uses workspace-chrome")
-    footer["content"]["mod"] = "workspace-chrome-containers"
-    tree["cloned_from"] = {"name": "main", "version": version}
-    return tree
-
-
 def build(source, output, version):
     if not CONTAINERS.is_dir():
         raise ValueError(f"missing containers mod: {CONTAINERS}")
     for relative, _ in CLONES:
         if not (source / relative).is_dir():
             raise ValueError(f"missing source mod: {source / relative}")
-    tree = layout_from(source, version)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".herdr-containers-", dir=output.parent) as scratch:
         staged = Path(scratch)
-        (staged / "layouts").mkdir()
         (staged / "mods").mkdir()
         shutil.copytree(CONTAINERS, staged / "mods/containers")
         patcher = ROOT / "tools/patch-mods.py"
@@ -99,13 +55,11 @@ def build(source, output, version):
                                       str(staged / "mods" / name), f"herdr-app {version}"])
             if patched.returncode != 0:
                 raise ValueError(f"{name} could not be built from {source / relative}; {output} was not changed")
-        (staged / "layouts/main-containers.json").write_text(
-            json.dumps(tree, indent=2) + "\n", encoding="utf-8")
         (staged / "keys.json").write_text(json.dumps({
-            "layout:main-containers": {"ctrl-shift-y": "containers.toggle"},
+            "global": {"ctrl-shift-y": "containers.toggle"},
         }, indent=2) + "\n", encoding="utf-8")
         output.mkdir(parents=True, exist_ok=True)
-        for relative in ("layouts/main-containers.json", "keys.json", "mods/containers",
+        for relative in ("keys.json", "mods/containers",
                          *(f"mods/{name}" for _, name in CLONES)):
             target = output / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -122,10 +76,10 @@ def main():
                         help="Herdr defaults directory or installed app home")
     parser.add_argument("--source-version", help="version of an installed app home without Cargo.toml")
     parser.add_argument("--output", type=Path, default=ROOT / "herdr-containers",
-                        help="layout package directory")
+                        help="mod package directory")
     args = parser.parse_args()
     source = args.source.expanduser().resolve()
-    if not (source / "layouts/main.json").is_file() and (source / "defaults/layouts/main.json").is_file():
+    if not (source / "mods/spaces").is_dir() and (source / "defaults/mods/spaces").is_dir():
         source /= "defaults"
     try:
         build(source, args.output.expanduser().resolve(), source_version(source, args.source_version))
