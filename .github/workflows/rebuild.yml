@@ -1,0 +1,152 @@
+name: rebuild
+
+# Scheduled runs use the workflow file's last editor as actor. Only the owner
+# may start this workflow, and it only opens PRs or issues for review.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The token is needed to push the review branch. The upstream checkout
+      # below never keeps credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          path: herdr-containers
+          persist-credentials: true
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # tag=v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Find new Herdr release
+        id: release
+        shell: sh
+        working-directory: herdr-containers
+        run: |
+          set -eu
+          upstream=https://github.com/herdrdev/herdr-app
+          tags=$(git ls-remote --tags --refs --sort=-v:refname "$upstream" 'v*')
+          latest=$(printf '%s\n' "$tags" |
+            awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 " " $2; exit }')
+          test -n "$latest" || { echo 'No vX.Y.Z Herdr tag found' >&2; exit 1; }
+          tag=${latest##*/}
+          version=${tag#v}
+          tag_sha=${latest%% *}
+          tag_refs=$(git ls-remote --tags "$upstream" "refs/tags/$tag^{}")
+          peeled=$(printf '%s\n' "$tag_refs" | awk 'NR == 1 { print $1 }')
+          sha=${peeled:-$tag_sha}
+
+          current=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cloned_from"]["version"])' \
+            herdr-containers/mods/spaces-containers/mod.json)
+          newer=$(python3 -c 'import sys; a,b=(tuple(map(int,s.split("."))) for s in sys.argv[1:]); print(int(a>b))' \
+            "$version" "$current")
+          if [ "$newer" -eq 0 ]; then
+            exit 0
+          fi
+
+          branch=rebuild/herdr-$version
+          remote_branch=$(git ls-remote --heads origin "refs/heads/$branch")
+          open_prs=$(gh pr list --state open --head "$branch" --json number --jq 'length')
+          if [ -n "$remote_branch" ] || [ "$open_prs" -ne 0 ]; then
+            exit 0
+          fi
+          printf 'version=%s\nsha=%s\nbranch=%s\n' "$version" "$sha" "$branch" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        if: steps.release.outputs.version != ''
+        with:
+          repository: herdrdev/herdr-app
+          ref: ${{ steps.release.outputs.sha }}
+          path: herdr-app
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # tag=v7.1.0
+        if: steps.release.outputs.version != ''
+        with:
+          node-version: '22'
+      - name: Build clone mods
+        if: steps.release.outputs.version != ''
+        shell: sh
+        working-directory: herdr-containers
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -eu
+          log=$(mktemp)
+          body=$(mktemp)
+          trap 'rm -f "$log" "$body"' 0
+          if python3 -I tools/build-package.py --source ../herdr-app/defaults > "$log" 2>&1; then
+            cat "$log"
+          else
+            cat "$log"
+            title="Rebuild for Herdr $VERSION failed: patch anchor"
+            titles=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+              --jq '.[] | select(.pull_request == null) | .title')
+            if ! printf '%s\n' "$titles" | grep -Fxq "$title"; then
+              {
+                printf 'Herdr %s, tag commit %s\n\n```text\n' "$VERSION" "$SHA"
+                cat "$log"
+                printf '\n```\n'
+              } > "$body"
+              gh issue create --title "$title" --body-file "$body"
+            fi
+            exit 1
+          fi
+      - name: Retarget and check
+        if: steps.release.outputs.version != ''
+        shell: sh
+        working-directory: herdr-containers
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -eu
+          python3 -I tools/retarget-herdr.py --version "$VERSION" --sha "$SHA"
+          sh tools/check.sh
+      - name: Open rebuild PR
+        if: steps.release.outputs.version != ''
+        shell: sh
+        working-directory: herdr-containers
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.release.outputs.sha }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A .github/workflows/check.yml README.md herdr-containers/RECIPE.md \
+            herdr-containers/mods CHANGELOG.md
+          git commit -m "build: rebuild clones for herdr $VERSION"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          body=$(mktemp)
+          trap 'rm -f "$body"' 0
+          cat > "$body" <<EOF
+          Herdr version: $VERSION
+          Tag commit SHA: $SHA
+
+          sh tools/check.sh passed.
+
+          Maintainers: live-verify all five mods and the sidebar before merging.
+          Users must reinstall the swapped copies to receive upstream fixes.
+          EOF
+          # PRs created with GITHUB_TOKEN do not trigger this repo's other
+          # workflows; the owner-started check runs after merge to main.
+          gh pr create --base main --head "$BRANCH" \
+            --title "build: rebuild clones for herdr $VERSION" --body-file "$body"

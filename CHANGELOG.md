@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Daily rebuild workflow opens a PR when Herdr releases.
 - Demo video (2x) and a full-window preview from neutral demo containers.
 - README: how to add Containers to a layout you already use.
 

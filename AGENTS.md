@@ -54,6 +54,8 @@ Run `sh tools/check.sh` before proposing a commit. It runs Python and Node
 tests, syntax and JSON checks, the mod package drift test, and a whitespace check
 (`git diff --check` over tracked and untracked files). The drift test needs
 `../herdr-app/defaults`; CI fails if it is absent.
+CI runs on owner-started pushes to main or manual dispatch. The daily rebuild
+workflow is the exception: it only opens review PRs or failure issues.
 
 - After changing `requirements/feature/herdr-core`, run `test/sync-feature.sh`;
   `test/test_feature.py` fails until the `test/.devcontainer` copy matches.
@@ -68,7 +70,9 @@ tests, syntax and JSON checks, the mod package drift test, and a whitespace chec
 
 Read the new `herdr-app` defaults. Rebuild with
 `python3 -I tools/build-package.py --source <herdr-app>/defaults`. If an
-anchor fails, fix `tools/patch-mods.py`, then rebuild. Run `sh tools/check.sh`,
+anchor fails, fix `tools/patch-mods.py`, then rebuild. Run
+`python3 -I tools/retarget-herdr.py --version X.Y.Z --sha <tag commit SHA>`
+to update docs, CI, and the changelog. Run `sh tools/check.sh`,
 compare the drift test, and live-verify all five mods and the sidebar in a
 scratch app home before release. Swapped clones are frozen copies: they miss
 later fixes to shipped mods until rebuilt and reinstalled.
