@@ -1,0 +1,31 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: herdr-devcontainer
+      - uses: actions/checkout@v4
+        with:
+          repository: herdrdev/herdr-app
+          ref: 3e32d75e7aa2327d7b1f89caf3d5dafd1f44f1b2 # v0.1.9
+          path: herdr-app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check package
+        working-directory: herdr-devcontainer
+        run: sh tools/check.sh
