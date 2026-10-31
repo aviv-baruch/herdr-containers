@@ -267,9 +267,19 @@ class ContainerTests(unittest.TestCase):
             {"Type": "volume", "Source": "/var/lib/docker/volumes/repo/_data", "Destination": "/workspaces/service"},
         ]
         self.assertEqual(helper.workspace_for("", mounts, "/", True), "/workspaces/service")
-        self.assertEqual(helper.workspace_for("/home/me/elsewhere", mounts, "/app", True), "/workspaces/service")
+        self.assertEqual(helper.workspace_for("/home/me/elsewhere", mounts, "", True), "/workspaces/service")
         self.assertEqual(helper.workspace_for("", mounts[:2], "/", True), "")
         self.assertEqual(helper.workspace_for("", [{"Type": "volume", "Destination": "/workspaces/a/b"}], "/", True), "")
+
+    def test_image_working_dir_beats_a_guessed_workspaces_mount(self):
+        mounts = [{"Type": "volume", "Source": "/var/lib/docker/volumes/c/_data", "Destination": "/workspaces/cache"}]
+        self.assertEqual(helper.workspace_for("", mounts, "/app", True), "/app")
+        self.assertEqual(helper.workspace_for("/elsewhere/cache", mounts, "/app", True), "/app")
+        self.assertEqual(helper.workspace_for("", mounts, "/", True), "/workspaces/cache")
+
+    def test_clone_in_volume_label_beats_working_dir(self):
+        mounts = [{"Type": "volume", "Name": "vsc-remote-containers", "Destination": "/workspaces"}]
+        self.assertEqual(helper.workspace_for("", mounts, "/app", True, "repo"), "/workspaces/repo")
 
     def test_plain_container_keeps_its_working_dir(self):
         mounts = [{"Type": "volume", "Source": "/var/lib/docker/volumes/c/_data", "Destination": "/workspaces/cache"}]
@@ -386,8 +396,9 @@ class ContainerTests(unittest.TestCase):
                     argv = shlex.split(via)[1:] + ["true"]
                     with patch.object(helper.os, "execvpe") as execvpe:
                         helper.main(argv)
+                # The bind doesn't match these labels; the image's WORKDIR beats a guessed mount.
                 execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "vscode", "true",
-                                                                           workspace="/workspaces/project"),
+                                                                           workspace="/fallback"),
                                                 dict(os.environ))
 
     def test_newest_of_several_matches_wins_and_warns(self):

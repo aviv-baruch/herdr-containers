@@ -146,8 +146,10 @@ def workspace_for(folder, mounts, working_dir, devcontainer=False, repo_folder="
         # VS Code's Clone in Volume: the volume is /workspaces, the repo a folder in it.
         if repo_folder not in ("", ".", "..") and "/" not in repo_folder and "/workspaces" in dests:
             return f"/workspaces/{repo_folder}"
-        # A repo mounted from elsewhere at /workspaces/<name>, only when unambiguous.
-        found = sorted(d for d in dests if posixpath.dirname(d) == "/workspaces")
+        # A repo mounted from elsewhere at /workspaces/<name>: only a guess, so only when the
+        # image names no folder of its own, and only when unambiguous.
+        found = sorted(d for d in dests if posixpath.dirname(d) == "/workspaces"
+                       and (working_dir or "/") == "/")
         named = f"/workspaces/{os.path.basename(folder.rstrip(os.sep))}" if folder else None
         if named in found:
             return named

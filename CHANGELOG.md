@@ -28,7 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   workspace instead of `/`. Repos cloned into a volume (VS Code's Clone
   Repository in Container Volume) are found too. A container whose Herdr Core
   is already running keeps the old folder until that core restarts: rebuild or
-  restart the container, or reconnect it with Repair.
+  restart the container, or run `hc machine update <machine>`.
 
 ## [0.1.0] - 2026-10-30
 
