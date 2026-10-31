@@ -79,7 +79,9 @@ def machine_name(folder):
     return name
 
 
-def exec_argv(docker, container_id, user, line, remote_env=None):
+def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
+    # Core starts terminals in its own folder when Herdr names none; the image's
+    # WORKDIR is often empty (/), so start in the workspace when it exists.
     script = """if [ -z "${SHELL:-}" ]; then
     unset SHELL
     user=$(id -un)
@@ -90,12 +92,14 @@ def exec_argv(docker, container_id, user, line, remote_env=None):
     fi
     [ -z "$shell" ] || export SHELL="$shell"
 fi
+# stdout carries the connection: cd must never print.
+[ "$#" -lt 2 ] || cd -- "$2" >/dev/null 2>&1 || :
 exec sh -c "$1"
 """
     return [docker, "exec", "-i", *(["-u", user] if user else []),
             *(part for name in (remote_env or {}) if isinstance(name, str) and ENV_NAME.fullmatch(name)
               for part in ("-e", name)),
-            container_id, "sh", "-c", script, "sh", line]
+            container_id, "sh", "-c", script, "sh", line, *([workspace] if workspace else [])]
 
 
 def exec_container(docker, row, container_id, line):
@@ -104,7 +108,7 @@ def exec_container(docker, row, container_id, line):
     env = {**os.environ, **remote}
     # A remote PATH must not change where the host finds Docker.
     executable = (shutil.which(docker) or docker) if "PATH" in remote else docker
-    os.execvpe(executable, exec_argv(docker, container_id, row["user"], line, remote), env)
+    os.execvpe(executable, exec_argv(docker, container_id, row["user"], line, remote, row.get("workspace")), env)
 
 
 def shell_quote(value):
@@ -115,7 +119,7 @@ def same_folder(a, b):
     return os.path.realpath(a) == os.path.realpath(b)
 
 
-def workspace_for(folder, mounts, working_dir):
+def workspace_for(folder, mounts, working_dir, devcontainer=False, repo_folder=""):
     best = None
     if folder:
         folder = os.path.realpath(folder)
@@ -137,6 +141,20 @@ def workspace_for(folder, mounts, working_dir):
         source, dest = best
         relative = os.path.relpath(folder, source)
         return posixpath.normpath(posixpath.join(dest, relative))
+    if devcontainer:
+        dests = {posixpath.normpath(m.get("Destination") or "/") for m in mounts}
+        # VS Code's Clone in Volume: the volume is /workspaces, the repo a folder in it.
+        if repo_folder not in ("", ".", "..") and "/" not in repo_folder and "/workspaces" in dests:
+            return f"/workspaces/{repo_folder}"
+        # A repo mounted from elsewhere at /workspaces/<name>: only a guess, so only when the
+        # image names no folder of its own, and only when unambiguous.
+        found = sorted(d for d in dests if posixpath.dirname(d) == "/workspaces"
+                       and (working_dir or "/") == "/")
+        named = f"/workspaces/{os.path.basename(folder.rstrip(os.sep))}" if folder else None
+        if named in found:
+            return named
+        if len(found) == 1:
+            return found[0]
     return working_dir if working_dir and working_dir != "/" else ""
 
 
@@ -179,7 +197,8 @@ def rows(containers):
         folder = labels.get("devcontainer.local_folder") or labels.get("vsch.local.folder") or ""
         raw = labels.get("devcontainer.metadata")
         # Folderless CLI builds use vsc-* images; metadata on other images alone is insufficient.
-        devcontainer = bool(folder or ("devcontainer.metadata" in labels and re.fullmatch(r"vsc-.+", config.get("Image") or "")))
+        devcontainer = bool(folder or "vsch.local.repository" in labels
+                            or ("devcontainer.metadata" in labels and re.fullmatch(r"vsc-.+", config.get("Image") or "")))
         name = item.get("Name", "").lstrip("/")
         row = {
             "folder": folder,
@@ -188,7 +207,8 @@ def rows(containers):
             "kind": "devcontainer" if devcontainer else "container",
             "state": state,
             "has_feature": devcontainer and metadata_has_feature(raw),
-            "workspace": workspace_for(folder, item.get("Mounts") or [], config.get("WorkingDir")),
+            "workspace": workspace_for(folder, item.get("Mounts") or [], config.get("WorkingDir"), devcontainer,
+                                       labels.get("vsch.local.repository.folder") or ""),
             "user": metadata_user(raw) or config.get("User") or None,
             "image": config.get("Image", ""),
             "via": f"hc-devcontainer {shell_quote(folder)}" if folder else f"hc-devcontainer --container {shell_quote(name)}",

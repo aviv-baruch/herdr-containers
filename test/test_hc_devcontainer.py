@@ -172,6 +172,30 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, shell + "\n")
 
+    def test_workspace_is_its_own_arg_and_only_when_known(self):
+        line = "pwd"
+        self.assertEqual(helper.exec_argv("docker", "abc", None, line, workspace="/w s")[-3:], ["sh", line, "/w s"])
+        self.assertEqual(helper.exec_argv("docker", "abc", None, line, workspace="")[-2:], ["sh", line])
+        self.assertEqual(helper.exec_argv("docker", "abc", None, line, workspace=None)[-2:], ["sh", line])
+
+    def test_wrapper_starts_in_the_workspace_and_survives_a_missing_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            odd = Path(temp) / "it's a \"dir\" $HOME"
+            odd.mkdir()
+            elsewhere = Path(temp) / "elsewhere"
+            elsewhere.mkdir()
+            env = {**os.environ, "SHELL": "/bin/sh"}
+            for workspace, expected in ((str(odd), str(odd)), (f"{temp}/missing", str(elsewhere)),
+                                        ("", str(elsewhere))):
+                with self.subTest(workspace=workspace):
+                    argv = helper.exec_argv("docker", "abc", None, "pwd -P", workspace=workspace)
+                    script = argv[argv.index("-c") + 1]
+                    result = subprocess.run(["/bin/sh", "-c", script, *argv[argv.index("-c") + 2:]],
+                                            cwd=elsewhere, env=env, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, os.path.realpath(expected) + "\n")
+                    self.assertEqual(result.stderr, "")
+
 
 class ContainerTests(unittest.TestCase):
     def setUp(self):
@@ -236,6 +260,67 @@ class ContainerTests(unittest.TestCase):
         dev["Config"]["WorkingDir"] = "/"
         self.assertEqual(helper.rows([dev])[0]["workspace"], "")
 
+    def test_repo_mounted_at_a_workspaces_folder(self):
+        mounts = [
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/uv/_data", "Destination": "/home/vscode/.cache/uv"},
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/venv/_data", "Destination": "/workspace/.venv"},
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/repo/_data", "Destination": "/workspaces/service"},
+        ]
+        self.assertEqual(helper.workspace_for("", mounts, "/", True), "/workspaces/service")
+        self.assertEqual(helper.workspace_for("/home/me/elsewhere", mounts, "", True), "/workspaces/service")
+        self.assertEqual(helper.workspace_for("", mounts[:2], "/", True), "")
+        self.assertEqual(helper.workspace_for("", [{"Type": "volume", "Destination": "/workspaces/a/b"}], "/", True), "")
+
+    def test_image_working_dir_beats_a_guessed_workspaces_mount(self):
+        mounts = [{"Type": "volume", "Source": "/var/lib/docker/volumes/c/_data", "Destination": "/workspaces/cache"}]
+        self.assertEqual(helper.workspace_for("", mounts, "/app", True), "/app")
+        self.assertEqual(helper.workspace_for("/elsewhere/cache", mounts, "/app", True), "/app")
+        self.assertEqual(helper.workspace_for("", mounts, "/", True), "/workspaces/cache")
+
+    def test_clone_in_volume_label_beats_working_dir(self):
+        mounts = [{"Type": "volume", "Name": "vsc-remote-containers", "Destination": "/workspaces"}]
+        self.assertEqual(helper.workspace_for("", mounts, "/app", True, "repo"), "/workspaces/repo")
+
+    def test_plain_container_keeps_its_working_dir(self):
+        mounts = [{"Type": "volume", "Source": "/var/lib/docker/volumes/c/_data", "Destination": "/workspaces/cache"}]
+        self.assertEqual(helper.workspace_for("", mounts, "/app"), "/app")
+        self.assertEqual(helper.workspace_for("", mounts, "/"), "")
+
+    def test_matching_bind_mount_beats_a_workspaces_volume(self):
+        mounts = [
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/repo/_data", "Destination": "/workspaces/other"},
+            {"Type": "bind", "Source": "/home/me/project", "Destination": "/workspace"},
+        ]
+        self.assertEqual(helper.workspace_for("/home/me/project", mounts, "/", True), "/workspace")
+
+    def test_several_workspaces_mounts_never_guess(self):
+        mounts = [
+            {"Type": "bind", "Source": "/srv/lib", "Destination": "/workspaces/shared-lib"},
+            {"Type": "volume", "Source": "/var/lib/docker/volumes/x/_data", "Destination": "/workspaces/service"},
+        ]
+        self.assertEqual(helper.workspace_for("/elsewhere/service", mounts, "/", True), "/workspaces/service")
+        self.assertEqual(helper.workspace_for("/elsewhere/service", mounts[::-1], "/", True), "/workspaces/service")
+        self.assertEqual(helper.workspace_for("", mounts, "/app", True), "/app")
+        self.assertEqual(helper.workspace_for("/elsewhere/other", mounts, "/", True), "")
+
+    def test_clone_in_volume_container(self):
+        # VS Code's Clone Repository in Container Volume (vscode-remote-release #1581, #2881).
+        clone = {
+            "Id": "clone-id", "Name": "/clone", "Created": "2026-10-31",
+            "State": {"Status": "running", "Running": True},
+            "Config": {"Labels": {"vsch.local.repository": "https://github.com/me/try-node.git",
+                                  "vsch.local.repository.volume": "vsc-remote-containers",
+                                  "vsch.local.repository.folder": "try-node",
+                                  "devcontainer.metadata": '[{"remoteUser":"node"}]'},
+                       "WorkingDir": "", "Image": "mcr.microsoft.com/devcontainers/javascript-node"},
+            "Mounts": [{"Type": "volume", "Name": "vsc-remote-containers", "Destination": "/workspaces"}],
+        }
+        row = helper.rows([clone])[0]
+        self.assertEqual((row["kind"], row["workspace"], row["user"]), ("devcontainer", "/workspaces/try-node", "node"))
+        self.assertEqual(row["via"], "hc-devcontainer --container 'clone'")
+        clone["Config"]["Labels"]["vsch.local.repository.folder"] = "../etc"
+        self.assertEqual(helper.rows([clone])[0]["workspace"], "")
+
     def test_metadata_only_is_a_plain_container_with_the_metadata_user(self):
         # A plain `docker run` of an image the devcontainers tooling built still carries its metadata.
         dev = copy.deepcopy(self.dev)
@@ -289,7 +374,8 @@ class ContainerTests(unittest.TestCase):
                 patch.object(helper.os, "execvpe") as execvpe:
             self.assertIsNone(helper.main(["/home/me/My Project", "true"]))
         folder_ids.assert_called_once_with("docker")
-        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "builder", "true"),
+        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "builder", "true",
+                                                                   workspace="/workspaces/project"),
                                         dict(os.environ))
 
     def test_ls_via_round_trips_through_sh_for_odd_labels(self):
@@ -310,7 +396,9 @@ class ContainerTests(unittest.TestCase):
                     argv = shlex.split(via)[1:] + ["true"]
                     with patch.object(helper.os, "execvpe") as execvpe:
                         helper.main(argv)
-                execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "vscode", "true"),
+                # The bind doesn't match these labels; the image's WORKDIR beats a guessed mount.
+                execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "vscode", "true",
+                                                                           workspace="/fallback"),
                                                 dict(os.environ))
 
     def test_newest_of_several_matches_wins_and_warns(self):
@@ -324,7 +412,7 @@ class ContainerTests(unittest.TestCase):
             errors = io.StringIO()
             with redirect_stderr(errors):
                 helper.main(["/home/me/My Project", "true"])
-        self.assertEqual(execvpe.call_args.args[1][-6], "new-id")
+        self.assertEqual(execvpe.call_args.args[1][-7], "new-id")
         self.assertIn("2 containers match; using newest new-id", errors.getvalue())
 
     def test_shell_quote_handles_apostrophe(self):
@@ -444,7 +532,8 @@ class ContainerTests(unittest.TestCase):
         with patch.object(helper, "inspect", return_value=[self.plain]), \
                 patch.object(helper.os, "execvpe") as execvpe:
             self.assertEqual(helper.main(["--container", "My Project", line]), 0)
-        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "My Project", "builder", line),
+        execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "My Project", "builder", line,
+                                                                   workspace="/app"),
                                         dict(os.environ))
 
     def test_container_must_be_running(self):
