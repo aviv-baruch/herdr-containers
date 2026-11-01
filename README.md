@@ -18,6 +18,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 - Herdr app 0.1.10 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
+- On Windows: Python 3 (the `py` launcher, or `python` on PATH) and `requirements/hc-devcontainer.cmd` beside the helper. See [Windows](#windows).
 - Optional: the [Herdr Core Feature](requirements/feature/herdr-core/README.md) to preserve core state across dev container rebuilds.
 
 ## Install
@@ -41,6 +42,8 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 requirements/hc-devcontainer "$HOME/.local/bin/hc-devcontainer"
 hc-devcontainer ls --all --json
 ```
+
+On Windows, see [Windows](#windows) for the helper instead.
 
 Herdr's app home is `$HERDR_APP_HOME`, else `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`. Check for name clashes before copying. Rename a new mod and all its references if a name is taken; never overwrite an existing mod. The recipe's Watch out lists references inside code. From the repo root:
 
@@ -119,6 +122,20 @@ cp -R requirements/feature/herdr-core "$project/.devcontainer/herdr-core"
 ```
 
 Add `"features": { "./herdr-core": { "version": "latest" } }` to that project's `devcontainer.json`, then rebuild. Its [README](requirements/feature/herdr-core/README.md) explains state and version handling. The Feature installs `curl` and `tar` with apt or apk if needed.
+
+### Windows
+
+Windows starts neither shebang scripts nor files without an extension, so the app runs the helper as `cmd /d /c hc-devcontainer …`, and `hc-devcontainer.cmd` starts the Python script beside it. Install both into one folder on the app's PATH, for example the folder that holds `hc`. In PowerShell, from the repo root:
+
+```powershell
+$bin = "$env:LOCALAPPDATA\Programs\herdr-core"
+Copy-Item requirements\hc-devcontainer, requirements\hc-devcontainer.cmd $bin
+hc-devcontainer ls --all --json
+```
+
+The panel then lists, starts and checks your containers. Docker Desktop labels dev containers with Windows folders (`c:\Users\…`) and reports their mounts as `/run/desktop/mnt/host/c/…`, `/host_mnt/c/…` or `/mnt/c/…`; the helper treats these as the same folder, ignoring case, wherever it runs.
+
+Connecting needs core to run the helper as a `--via` machine, and Herdr Core on Windows refuses every `--via` command, so **Connect** and **Repair** say so instead. To connect, run Herdr (app and core) inside WSL, or on Linux or macOS, with the helper installed there as above; Docker Desktop's WSL integration gives WSL the same containers.
 
 ## Using it
 

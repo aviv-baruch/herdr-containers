@@ -37,7 +37,11 @@ mods other people made"). The app home is
    install -m 755 requirements/hc-devcontainer "$HOME/.local/bin/hc-devcontainer"
    ```
    `~/.local/bin` must be on the PATH of both the app and core (restart core after changing
-   its PATH).
+   its PATH). On Windows, copy both `requirements/hc-devcontainer` and
+   `requirements/hc-devcontainer.cmd` into one folder on the app's PATH (the README's Windows
+   section) and check Python 3 runs (`py -3` or `python`). Tell the person that Herdr Core on
+   Windows refuses `--via` machines: the panel lists and starts containers, but connecting
+   needs Herdr in WSL, Linux or macOS.
 3. Copy `herdr-containers/mods/containers/` into `$app_home/mods/`, plus the four
    `*-containers` folders if the person takes the swaps. Leave out `RECIPE.md`, `preview.png`
    and `demo.*`. Never overwrite a mod (theirs or Herdr's): on a clash, rename the new folder
@@ -88,6 +92,8 @@ mods other people made"). The app home is
 | Symptom | Cause / fix |
 |---|---|
 | "hc-devcontainer is not installed (put it on PATH)" | The app can't run it. Put it in a folder on the app's PATH; reopen Herdr if you changed that PATH. |
+| "… put it and hc-devcontainer.cmd on PATH" (Windows) | cmd can't find the launcher. Copy `hc-devcontainer` and `hc-devcontainer.cmd` into one folder on the app's PATH; install Python 3. |
+| "Herdr Core on Windows can't connect to containers" | Windows core refuses `--via` machines. Run Herdr in WSL (or Linux/macOS) with the helper there. |
 | "hc is not installed" right after adding | Core can't find `hc-devcontainer` (sh exits 127). Put it on core's PATH, restart core. |
 | "Docker isn't running" | Start Docker. Dev containers stay stopped: use **Start** on the row. |
 | Dev container listed under Other containers | It has no folder label (`devcontainer.local_folder` or `vsch.local.folder`) and isn't a `vsc-*` image with devcontainer metadata. Start it with VS Code or `devcontainer up`. |

@@ -13,6 +13,11 @@ const visibleRows = (rows) => rows.filter((r) =>
   && (r.kind !== "devcontainer" || r.state === "running" || r.state === "paused" || setting("showStopped", true)));
 // The container a saved plain-container via names (docker names never hold a quote).
 const plainName = (target) => target.match(/^hc-devcontainer --container '([^']+)'$/)?.[1];
+const onWindows = () => window()?.platform === "windows";
+// Windows starts only .exe files by name; cmd finds hc-devcontainer.cmd, which runs the Python helper.
+const helper = (args) => onWindows()
+  ? exec("cmd", ["/d", "/c", "hc-devcontainer", ...args])
+  : exec("hc-devcontainer", args);
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -40,6 +45,14 @@ function errorText(r) {
     if (e?.message) return e.message;
   } catch {}
   return (r.stderr || r.stdout || "it didn't answer").trim();
+}
+
+// Herdr Core on Windows refuses every --via machine (herdr-core machines.rs check_target).
+function addError(r) {
+  const text = errorText(r);
+  return onWindows() && /run by sh here/.test(text)
+    ? "Herdr Core on Windows can't connect to containers (it has no --via); use Herdr in WSL, Linux or macOS"
+    : text;
 }
 
 export default class Containers extends View {
@@ -98,11 +111,13 @@ export default class Containers extends View {
   async load() {
     const machineListStartedAt = Date.now();
     const [listed, saved] = await Promise.all([
-      safe(exec("hc-devcontainer", ["ls", "--all", "--json"])),
+      safe(helper(["ls", "--all", "--json"])),
       safe(hc(["machine", "ls", "--json"])),
     ]);
     let rows = null;
     try {
+      // cmd's "not recognized" is localized; its exit code is not.
+      if (listed.code === 9009 && onWindows()) throw new Error("cannot run hc-devcontainer: not found");
       if (listed.code !== 0) throw new Error(errorText(listed));
       rows = JSON.parse(listed.stdout);
       if (!Array.isArray(rows)) throw new Error("invalid container list");
@@ -112,8 +127,9 @@ export default class Containers extends View {
       const message = String(e.message ?? e);
       // The app's own spawn failure (mods.rs run_blocking), not the helper's about docker.
       this.error = /^(Error: )?cannot run hc-devcontainer:/.test(message)
-        ? "hc-devcontainer is not installed (put it on PATH)"
-        : /Cannot connect to the Docker daemon/i.test(message) ? "Docker isn't running" : message;
+        ? `hc-devcontainer is not installed (put it${onWindows() ? " and hc-devcontainer.cmd" : ""} on PATH)`
+        // Docker Desktop on Windows names its pipe instead.
+        : /Cannot connect to the Docker daemon|open \/\/\.\/pipe\/docker/i.test(message) ? "Docker isn't running" : message;
     }
     try {
       if (saved.code !== 0) throw new Error(errorText(saved));
@@ -133,7 +149,7 @@ export default class Containers extends View {
     if (rows && !this.machineError) {
       // A connected machine is never gone; Docker answers for the rest, whatever their via's form.
       const checked = await Promise.all(this.missing(rows).filter((m) => m.state !== "connected")
-        .map(async (m) => [m, (await safe(exec("hc-devcontainer", ["exists", m.target]))).code]));
+        .map(async (m) => [m, (await safe(helper(["exists", m.target]))).code]));
       for (const [m, code] of checked) {
         const name = code === 0 && plainName(m.target);
         if (code === 1) gone.push(m);
@@ -188,7 +204,7 @@ export default class Containers extends View {
     cx.spawn(async (cx) => {
       const wanted = freeName(row.suggested_name, this.taken);
       const r = await safe(hc(["machine", "add", "--name", wanted, "--via", row.via, "--install", "--json"]));
-      if (r.code !== 0) this.state[row.id] = errorText(r);
+      if (r.code !== 0) this.state[row.id] = addError(r);
       else {
         let name = wanted;
         try { name = JSON.parse(r.stdout).name || name; } catch {}
@@ -207,7 +223,7 @@ export default class Containers extends View {
     this.state[row.id] = "starting";
     cx.notify();
     cx.spawn(async (cx) => {
-      const r = await safe(exec("hc-devcontainer", ["start", row.id]));
+      const r = await safe(helper(["start", row.id]));
       if (r.code === 0) {
         delete this.state[row.id];
         this.refresh(cx);
@@ -228,7 +244,7 @@ export default class Containers extends View {
       let r = added;
       if (r.code === 0) r = await safe(hc(["machine", "rm", saved.name]));
       if (r.code === 0) r = await safe(hc(["machine", "rename", spare, saved.name]));
-      if (r.code !== 0) this.state[row.id] = errorText(r);
+      if (r.code !== 0) this.state[row.id] = addError(r);
       else {
         this.state[row.id] = "connecting";
         let core = null;

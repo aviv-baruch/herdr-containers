@@ -612,3 +612,63 @@ test("polls only while shown or waiting, and looks again when it shows", () => {
   poll(a.cx);
   assert.equal(a.events.length, 0);
 });
+
+test("on Windows the helper runs through cmd, which finds hc-devcontainer.cmd", async () => {
+  const a = app();
+  a.realRefresh();
+  a.win.platform = "windows";
+  const calls = [];
+  const saved = [{ name: "gone", via: true, target: "hc-devcontainer 'c:\\w\\gone'", state: "unreachable" }];
+  a.setHc(async () => ({ code: 0, stdout: JSON.stringify({ machines: saved }) }));
+  a.setExec(async (cmd, args) => { calls.push([cmd, ...args]); return { code: args[3] === "ls" ? 0 : 1, stdout: "[]" }; });
+  a.view.refresh(a.cx);
+  await settle();
+  a.view.start({ id: "dev-id", name: "dev", kind: "devcontainer", state: "exited" }, a.cx);
+  await settle();
+  assert.deepEqual(calls, [
+    ["cmd", "/d", "/c", "hc-devcontainer", "ls", "--all", "--json"],
+    ["cmd", "/d", "/c", "hc-devcontainer", "exists", "hc-devcontainer 'c:\\w\\gone'"],
+    ["cmd", "/d", "/c", "hc-devcontainer", "start", "dev-id"],
+  ]);
+  delete a.win.platform;
+  calls.length = 0;
+  a.view.refresh(a.cx);
+  await settle();
+  assert.deepEqual(calls[0], ["hc-devcontainer", "ls", "--all", "--json"]);
+});
+
+test("on Windows a helper cmd can't find reads as missing, and Docker Desktop down as Docker down", async () => {
+  const a = app();
+  a.realRefresh();
+  a.win.platform = "windows";
+  a.setHc(async () => ({ code: 0, stdout: '{"machines":[]}' }));
+  // cmd's "not recognized" is localized; its exit code 9009 is not.
+  a.setExec(async () => ({ code: 9009, stdout: "", stderr: "'hc-devcontainer' n'est pas reconnu…\r\n" }));
+  a.view.refresh(a.cx);
+  await settle();
+  assert.equal(a.view.error, "hc-devcontainer is not installed (put it and hc-devcontainer.cmd on PATH)");
+  a.setExec(async () => ({ code: 1, stdout: "", stderr: "hc-devcontainer: error during connect: Get \"http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.47/containers/json\": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.\n" }));
+  a.view.refresh(a.cx);
+  await settle();
+  assert.equal(a.view.error, "Docker isn't running");
+});
+
+test("on Windows core's refusal of --via machines is explained on Connect and Repair", async () => {
+  const a = app();
+  a.win.platform = "windows";
+  const refused = { code: 1, stdout: JSON.stringify({ error: { message: "bad command \"hc-devcontainer 'c:\\\\w'\": one line, run by sh here" } }) };
+  const explained = "Herdr Core on Windows can't connect to containers (it has no --via); use Herdr in WSL, Linux or macOS";
+  a.setHc(async () => refused);
+  const row = { id: "dev-id", name: "dev", kind: "devcontainer", state: "running", via: "hc-devcontainer 'c:\\w'", suggested_name: "dev" };
+  a.view.open(row, a.cx);
+  await settle();
+  assert.equal(a.view.state["dev-id"], explained);
+  a.view.repair(row, { name: "dev", via: true, target: row.via, state: "unreachable" }, a.cx);
+  await settle();
+  assert.equal(a.view.state["dev-id"], explained);
+  // Elsewhere core's own words stay.
+  delete a.win.platform;
+  a.view.open(row, a.cx);
+  await settle();
+  assert.match(a.view.state["dev-id"], /run by sh here/);
+});
