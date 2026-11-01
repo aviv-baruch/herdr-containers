@@ -124,8 +124,71 @@ pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
 for url do printf '%s\\n' "$url" >>"$dir/open"; done
 """
 
+# Git's credential helper in the container, like VS Code's: each request goes to
+# the host's `git credential` through `serve`. Without a live listener it stays
+# silent, so git carries on as if it weren't configured.
+CREDENTIAL_HELPER = """#!/bin/sh
+dir=$(dirname -- "$0")
+case "${1:-}" in get|store|erase) ;; *) exit 0 ;; esac
+pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
+    tr '\\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q hc-devcontainer-serve || exit 0
+umask 077
+id=$$-$(date +%s)
+{ echo "$1"; cat; } >"$dir/cred/$id.tmp" 2>/dev/null && mv -f "$dir/cred/$id.tmp" "$dir/cred/$id.req" || {
+    rm -f "$dir/cred/$id.tmp"
+    exit 0
+}
+[ "$1" = get ] || exit 0
+# The host may show its own sign-in; give it time.
+end=$(($(date +%s) + 120))
+while [ ! -e "$dir/cred/$id.res" ]; do
+    [ "$(date +%s)" -lt "$end" ] || {
+        rm -f "$dir/cred/$id.req"
+        echo "herdr-containers: no answer from the host's git" >&2
+        exit 0
+    }
+    sleep 0.2 2>/dev/null || sleep 1
+done
+if [ -s "$dir/cred/$id.msg" ]; then
+    printf "herdr-containers: the host's git could not answer: " >&2
+    cat "$dir/cred/$id.msg" >&2
+fi
+cat "$dir/cred/$id.res"
+rm -f "$dir/cred/$id.res" "$dir/cred/$id.msg"
+"""
+
+# git runs a "!" helper through sh with the operation appended.
+GIT_CREDENTIAL = '!f() { h="$HOME/.cache/herdr-containers/git-credential"; [ ! -x "$h" ] || "$h" "$@"; }; f'
+
+# Adds the helper ($2) to git config at scope $1, once.
+CREDENTIAL_CONFIG = """command -v git >/dev/null 2>&1 || exit 0
+git config "--$1" --get-all credential.helper 2>/dev/null | grep -qxF -- "$2" ||
+    git config "--$1" --add credential.helper "$2"
+"""
+
+# Installs the helper from stdin for this user, then configures it if $1 names a scope.
+CREDENTIAL_SETUP = """umask 077
+dir="$HOME/.cache/herdr-containers"
+mkdir -p "$dir" && chmod 700 "$dir" || exit 1
+if ! { cat >"$dir/git-credential.$$" && chmod 755 "$dir/git-credential.$$" &&
+        mv -f "$dir/git-credential.$$" "$dir/git-credential"; }; then
+    rm -f "$dir/git-credential.$$"
+    exit 1
+fi
+[ -n "$1" ] || exit 0
+""" + CREDENTIAL_CONFIG
+
+# The host's answer to request $1, from stdin; $2, if any, says why there is none.
+CREDENTIAL_ANSWER = """umask 077
+cred="$HOME/.cache/herdr-containers/cred"
+[ -d "$cred" ] || exit 0
+[ -z "${2:-}" ] || printf '%s\\n' "$2" >"$cred/$1.msg"
+cat >"$cred/$1.tmp" && mv -f "$cred/$1.tmp" "$cred/$1.res"
+"""
+
 # One listener per container user (hc-devcontainer-serve marks its cmdline).
-# Prints "open URL" and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
+# Prints "open URL", "cred ID HEX" (a credential request, hex because it spans
+# lines) and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
 # Exit 3: another runs; 4: no home to work in.
 LISTEN = """# hc-devcontainer-serve
 umask 077
@@ -145,18 +208,28 @@ exec 3<&0
 (cat <&3 >/dev/null; kill $$) &
 exec 3<&-
 rm -f "$dir/open"
+rm -rf "$dir/cred"
+mkdir "$dir/cred" || exit 4
 last=
 while :; do
     if [ -s "$dir/open" ] && mv -f "$dir/open" "$dir/open.$$" 2>/dev/null; then
         sed 's/^/open /' "$dir/open.$$" || exit 0
         rm -f "$dir/open.$$"
     fi
+    for req in "$dir"/cred/*.req; do
+        [ -f "$req" ] || continue
+        id=${req##*/}
+        id=${id%.req}
+        mv -f "$req" "$dir/cred/$id.work" 2>/dev/null || continue
+        echo "cred $id $(od -An -v -tx1 <"$dir/cred/$id.work" | tr -d ' \\n')" || exit 0
+        rm -f "$dir/cred/$id.work"
+    done
     ports=$(awk '$4 == "0A" { print $2 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr '\\n' ' ')
     if [ "$ports" != "$last" ]; then
         echo "ports $ports" || exit 0
         last=$ports
     fi
-    sleep 1
+    sleep 0.5 2>/dev/null || sleep 1
 done
 """
 
@@ -227,8 +300,61 @@ def host_opener():
     return ["xdg-open"]
 
 
+# What GUI prompts and the opener need from the desktop session. Git Credential
+# Manager shows its window only with a display, and its secretservice store
+# needs the session bus; WSL needs its interop socket to start Windows programs.
+DESKTOP_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                "WSL_INTEROP")
+
+
+def state_dir():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state, "hc-devcontainer")
+
+
+def remember_desktop():
+    """The app runs this helper from the desktop session, but core, which runs serve, may not
+    be in it. Keep the session's variables for serve."""
+    found = {name: os.environ[name] for name in DESKTOP_VARS if os.environ.get(name)}
+    if not (found.get("DISPLAY") or found.get("WAYLAND_DISPLAY")):
+        return
+    path = os.path.join(state_dir(), "desktop.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            if json.load(stream) == found:
+                return
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        temp = f"{path}.{os.getpid()}"
+        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
+            json.dump(found, stream)
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def host_env():
+    """This environment, plus the remembered desktop session's variables it lacks."""
+    try:
+        with open(os.path.join(state_dir(), "desktop.json"), encoding="utf-8") as stream:
+            saved = json.load(stream)
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    return {**os.environ, **{name: value for name, value in saved.items()
+                             if name in DESKTOP_VARS and isinstance(value, str) and not os.environ.get(name)}}
+
+
+# Keys of git's credential protocol (key=value, a [] suffix for lists).
+CREDENTIAL_KEY = re.compile(r"[a-z_]+(?:\[\])?\Z")
+CREDENTIAL_ACTION = {"get": "fill", "store": "approve", "erase": "reject"}
+
+
 class Server:
-    """Opens the container's links here and forwards its listening ports."""
+    """Opens the container's links here, forwards its listening ports, and answers
+    its git credential requests from the host's git."""
 
     def __init__(self, docker, container, user):
         self.docker, self.container, self.user = docker, container, user
@@ -238,9 +364,61 @@ class Server:
         self.proc = None
         self.stopped = False
 
-    def exec_argv(self, script, *args):
-        return [self.docker, "exec", "-i", *(["-u", self.user] if self.user else []),
+    def exec_argv(self, script, *args, user=None):
+        user = user or self.user
+        return [self.docker, "exec", "-i", *(["-u", user] if user else []),
                 self.container, "sh", "-c", script, "sh", *args]
+
+    def setup_credentials(self):
+        """VS Code's git credential helper, configured where its setting says (global by default)."""
+        where = vscode_settings().get("dev.containers.gitCredentialHelperConfigLocation", "global")
+        if where not in ("global", "system"):
+            return
+        try:
+            installed = subprocess.run(self.exec_argv(CREDENTIAL_SETUP, "global" if where == "global" else "",
+                                                      GIT_CREDENTIAL),
+                                       input=CREDENTIAL_HELPER.encode(), capture_output=True, check=False)
+            if not installed.returncode and where == "system":
+                subprocess.run(self.exec_argv(CREDENTIAL_CONFIG, "system", GIT_CREDENTIAL, user="root"),
+                               stdin=subprocess.DEVNULL, capture_output=True, check=False)
+        except OSError:
+            pass
+
+    def credential(self, request_id, encoded):
+        """Answers one request with the host's `git credential`, as VS Code's helper does."""
+        try:
+            op, _, body = bytes.fromhex(encoded).decode().partition("\n")
+        except ValueError:
+            return
+        action = CREDENTIAL_ACTION.get(op.strip())
+        if not action or not re.fullmatch(r"[0-9]+-[0-9]+", request_id):
+            return
+        lines = [line for line in body.splitlines()
+                 if "\0" not in line and CREDENTIAL_KEY.match(line.partition("=")[0]) and "=" in line]
+        answer, why = b"", ""
+        if not shutil.which("git"):
+            why = "git is not installed on the host (or not on core's PATH)"
+        elif lines:
+            try:
+                # No terminal here; the host's helpers (keychain, GCM, askpass) may still ask.
+                found = subprocess.run(["git", "credential", action], input=("\n".join(lines) + "\n\n").encode(),
+                                       capture_output=True, timeout=110, check=False,
+                                       env={**host_env(), "GIT_TERMINAL_PROMPT": "0"})
+                if found.returncode:
+                    text = " ".join(found.stderr.decode(errors="replace").split())
+                    why = "".join(c for c in text if c.isprintable())[:300] or f"exit {found.returncode}"
+                elif action == "fill":
+                    answer = found.stdout
+            except subprocess.TimeoutExpired:
+                why = "the host's git credential helper timed out"
+            except OSError as error:
+                why = str(error)
+        if op.strip() == "get":
+            try:
+                subprocess.run(self.exec_argv(CREDENTIAL_ANSWER, request_id, *([why] if why else [])),
+                               input=answer, capture_output=True, check=False)
+            except OSError:
+                pass
 
     def relay(self, client, port):
         target = self.targets.get(port, "127.0.0.1")
@@ -337,7 +515,7 @@ class Server:
                 host = {"0.0.0.0": "localhost", "::": "localhost", "::1": "[::1]"}.get(parts.hostname, parts.hostname)
                 parts = parts._replace(netloc=f"{host}:{host_port}")
         try:
-            subprocess.Popen([*host_opener(), urllib.parse.urlunsplit(parts)], stdin=subprocess.DEVNULL,
+            subprocess.Popen([*host_opener(), urllib.parse.urlunsplit(parts)], stdin=subprocess.DEVNULL, env=host_env(),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             pass
@@ -353,6 +531,10 @@ class Server:
             kind, _, rest = line.rstrip("\n").partition(" ")
             if kind == "open":
                 self.open(rest)
+            elif kind == "cred":
+                # A host sign-in can take a while; links and ports go on meanwhile.
+                request_id, _, encoded = rest.partition(" ")
+                threading.Thread(target=self.credential, args=(request_id, encoded), daemon=True).start()
             elif kind == "ports":
                 self.ports(rest)
         proc.stdout.close()
@@ -360,6 +542,7 @@ class Server:
 
     def run(self):
         """Keeps one listener running until stop(), or until there is no home."""
+        self.setup_credentials()
         while self.listen_once() != 4:
             self.ports("")
             time.sleep(2)
@@ -567,8 +750,7 @@ def last_json(raw):
 
 
 def log_file(row):
-    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-    folder = os.path.join(state, "hc-devcontainer")
+    folder = state_dir()
     os.makedirs(folder, exist_ok=True)
     # Unbuffered: the CLI writes to the same file.
     return open(os.path.join(folder, f"{row['name']}.log"), "wb", buffering=0)
@@ -933,6 +1115,8 @@ def exists(docker, via):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     docker = os.environ.get("HC_DEVCONTAINER_DOCKER") or "docker"
+    if argv and argv[0] in ("ls", "start", "exists"):
+        remember_desktop()  # the app's own commands, from its desktop session
     if argv and argv[0] == "ls":
         parser = argparse.ArgumentParser(prog="hc-devcontainer ls")
         parser.add_argument("--all", action="store_true")
