@@ -1387,6 +1387,8 @@ class CredentialTests(unittest.TestCase):
                    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "OTHER": "not kept"}
             with patch.dict(os.environ, app), patch.object(helper, "inspect", return_value=[]), \
                     patch.object(helper, "ps", return_value=[]), redirect_stdout(io.StringIO()):
+                for name in set(helper.DESKTOP_VARS) - set(app):  # this machine's own
+                    os.environ.pop(name, None)
                 helper.main(["ls", "--json"])
             saved = Path(state) / "hc-devcontainer" / "desktop.json"
             self.assertEqual(json.loads(saved.read_text()), {
@@ -1395,7 +1397,7 @@ class CredentialTests(unittest.TestCase):
             # A run without a display (core's, or an ssh shell) keeps the record.
             core = {"XDG_STATE_HOME": state, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/own"}
             with patch.dict(os.environ, core):
-                for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+                for name in set(helper.DESKTOP_VARS) - set(core):
                     os.environ.pop(name, None)
                 with patch.object(helper, "inspect", return_value=[]), patch.object(helper, "ps", return_value=[]), \
                         redirect_stdout(io.StringIO()):
