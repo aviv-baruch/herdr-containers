@@ -114,8 +114,13 @@ class TargetVersionTests(unittest.TestCase):
                 self.assertEqual(found, version, path.relative_to(ROOT))
         for path in (ROOT / "README.md", PACKAGE / "RECIPE.md"):
             self.assertIn(f"Herdr app {version}", path.read_text(encoding="utf-8"), path.relative_to(ROOT))
+        pin = json.loads((ROOT / ".github/herdr-app.json").read_text(encoding="utf-8"))
+        self.assertEqual(pin["version"], version)
+        self.assertRegex(pin["sha"], r"^[0-9a-f]{40}$")
+        # GITHUB_TOKEN cannot push workflow edits, so the rebuild PR must not need any.
         ci = (ROOT / ".github/workflows/check.yml").read_text(encoding="utf-8")
-        self.assertEqual(re.findall(r"# v(\d+\.\d+\.\d+)", ci), [version])
+        self.assertNotRegex(ci, r"ref: [0-9a-fA-F]{40}")
+        self.assertIn(".github/herdr-app.json", ci)
 
 
 if __name__ == "__main__":

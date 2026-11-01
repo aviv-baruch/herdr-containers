@@ -25,10 +25,15 @@ jobs:
         with:
           path: herdr-containers
           persist-credentials: false
+      # The pin lives outside workflows so the rebuild PR can update it.
+      - name: Read Herdr pin
+        id: herdr
+        working-directory: herdr-containers
+        run: python3 -c 'import json; print("sha=" + json.load(open(".github/herdr-app.json"))["sha"])' >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
         with:
           repository: herdrdev/herdr-app
-          ref: 36725d47c89cd19345994363d6d9cdee5c42c80b # v0.1.10
+          ref: ${{ steps.herdr.outputs.sha }}
           path: herdr-app
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # tag=v7.1.0

@@ -1,7 +1,6 @@
 import importlib.util
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -14,10 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/retarget-herdr.py"
 OLD = json.loads((ROOT / "herdr-containers/mods/spaces-containers/mod.json").read_text())["cloned_from"]["version"]
 NEW = ".".join((*OLD.split(".")[:2], str(int(OLD.split(".")[2]) + 1)))
-OLD_SHA = re.search(r"ref: ([0-9a-f]{40}) # v" + re.escape(OLD),
-                    (ROOT / ".github/workflows/check.yml").read_text()).group(1)
 SHA = "a" * 40
-FILES = ("README.md", "herdr-containers/RECIPE.md", ".github/workflows/check.yml", "CHANGELOG.md")
+FILES = ("README.md", "herdr-containers/RECIPE.md", ".github/herdr-app.json", "CHANGELOG.md")
 CLONES = ("spaces", "agents", "settings", "workspace-chrome")
 
 
@@ -47,19 +44,18 @@ def invoke(root, version=NEW, sha=SHA):
 
 
 class RetargetHerdrTests(unittest.TestCase):
-    def test_updates_docs_ci_and_unreleased_changelog(self):
+    def test_updates_docs_ci_pin_and_unreleased_changelog(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             fixture(root)
-            before_ci = (root / ".github/workflows/check.yml").read_text()
             result = invoke(root)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"Herdr app {NEW}", (root / "README.md").read_text())
             self.assertIn(f"Herdr app {NEW}", (root / "herdr-containers/RECIPE.md").read_text())
             self.assertNotIn(f"Herdr app {OLD}", (root / "README.md").read_text())
             self.assertNotIn(f"Herdr app {OLD}", (root / "herdr-containers/RECIPE.md").read_text())
-            ci = (root / ".github/workflows/check.yml").read_text()
-            self.assertEqual(ci, before_ci.replace(f"{OLD_SHA} # v{OLD}", f"{SHA} # v{NEW}"))
+            pin = json.loads((root / ".github/herdr-app.json").read_text())
+            self.assertEqual(pin, {"version": NEW, "sha": SHA})
             self.assertIn(f"- Clones rebuilt for Herdr {NEW}.", (root / "CHANGELOG.md").read_text())
             after = snapshot(root)
             self.assertEqual(invoke(root).returncode, 0)
@@ -69,7 +65,7 @@ class RetargetHerdrTests(unittest.TestCase):
         for change, version, sha, expected in (
             (None, "1.2", SHA, "invalid version"),
             (None, NEW, "short", "invalid SHA"),
-            ("missing ci", NEW, SHA, "check.yml"),
+            ("missing pin", NEW, SHA, "herdr-app.json"),
             ("missing readme", NEW, SHA, "README.md"),
             ("missing recipe", NEW, SHA, "RECIPE.md"),
             ("missing changelog", NEW, SHA, "CHANGELOG.md"),
@@ -79,9 +75,8 @@ class RetargetHerdrTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)
                     fixture(root)
-                    if change == "missing ci":
-                        path = root / ".github/workflows/check.yml"
-                        path.write_text(path.read_text().replace(f" # v{OLD}", " # no version"))
+                    if change == "missing pin":
+                        (root / ".github/herdr-app.json").write_text("{}")
                     elif change == "missing readme":
                         path = root / "README.md"
                         path.write_text(path.read_text().replace(f"Herdr app {OLD}", "Herdr app unknown"))
