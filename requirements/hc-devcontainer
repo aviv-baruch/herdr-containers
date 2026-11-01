@@ -142,11 +142,19 @@ id=$$-$(date +%s)
 # The host may show its own sign-in; give it time.
 end=$(($(date +%s) + 120))
 while [ ! -e "$dir/cred/$id.res" ]; do
-    [ "$(date +%s)" -lt "$end" ] || { rm -f "$dir/cred/$id.req"; exit 0; }
+    [ "$(date +%s)" -lt "$end" ] || {
+        rm -f "$dir/cred/$id.req"
+        echo "herdr-containers: no answer from the host's git" >&2
+        exit 0
+    }
     sleep 0.2 2>/dev/null || sleep 1
 done
+if [ -s "$dir/cred/$id.msg" ]; then
+    printf "herdr-containers: the host's git could not answer: " >&2
+    cat "$dir/cred/$id.msg" >&2
+fi
 cat "$dir/cred/$id.res"
-rm -f "$dir/cred/$id.res"
+rm -f "$dir/cred/$id.res" "$dir/cred/$id.msg"
 """
 
 # git runs a "!" helper through sh with the operation appended.
@@ -170,10 +178,11 @@ fi
 [ -n "$1" ] || exit 0
 """ + CREDENTIAL_CONFIG
 
-# The host's answer to request $1, from stdin.
+# The host's answer to request $1, from stdin; $2, if any, says why there is none.
 CREDENTIAL_ANSWER = """umask 077
 cred="$HOME/.cache/herdr-containers/cred"
 [ -d "$cred" ] || exit 0
+[ -z "${2:-}" ] || printf '%s\\n' "$2" >"$cred/$1.msg"
 cat >"$cred/$1.tmp" && mv -f "$cred/$1.tmp" "$cred/$1.res"
 """
 
@@ -291,6 +300,53 @@ def host_opener():
     return ["xdg-open"]
 
 
+# What GUI prompts and the opener need from the desktop session. Git Credential
+# Manager shows its window only with a display, and its secretservice store
+# needs the session bus; WSL needs its interop socket to start Windows programs.
+DESKTOP_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                "WSL_INTEROP")
+
+
+def state_dir():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state, "hc-devcontainer")
+
+
+def remember_desktop():
+    """The app runs this helper from the desktop session, but core, which runs serve, may not
+    be in it. Keep the session's variables for serve."""
+    found = {name: os.environ[name] for name in DESKTOP_VARS if os.environ.get(name)}
+    if not (found.get("DISPLAY") or found.get("WAYLAND_DISPLAY")):
+        return
+    path = os.path.join(state_dir(), "desktop.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            if json.load(stream) == found:
+                return
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        temp = f"{path}.{os.getpid()}"
+        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
+            json.dump(found, stream)
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def host_env():
+    """This environment, plus the remembered desktop session's variables it lacks."""
+    try:
+        with open(os.path.join(state_dir(), "desktop.json"), encoding="utf-8") as stream:
+            saved = json.load(stream)
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    return {**os.environ, **{name: value for name, value in saved.items()
+                             if name in DESKTOP_VARS and isinstance(value, str) and not os.environ.get(name)}}
+
+
 # Keys of git's credential protocol (key=value, a [] suffix for lists).
 CREDENTIAL_KEY = re.compile(r"[a-z_]+(?:\[\])?\Z")
 CREDENTIAL_ACTION = {"get": "fill", "store": "approve", "erase": "reject"}
@@ -339,20 +395,28 @@ class Server:
             return
         lines = [line for line in body.splitlines()
                  if "\0" not in line and CREDENTIAL_KEY.match(line.partition("=")[0]) and "=" in line]
-        answer = b""
-        if lines and shutil.which("git"):
+        answer, why = b"", ""
+        if not shutil.which("git"):
+            why = "git is not installed on the host (or not on core's PATH)"
+        elif lines:
             try:
                 # No terminal here; the host's helpers (keychain, GCM, askpass) may still ask.
                 found = subprocess.run(["git", "credential", action], input=("\n".join(lines) + "\n\n").encode(),
                                        capture_output=True, timeout=110, check=False,
-                                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-                answer = found.stdout if action == "fill" and not found.returncode else b""
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                                       env={**host_env(), "GIT_TERMINAL_PROMPT": "0"})
+                if found.returncode:
+                    text = " ".join(found.stderr.decode(errors="replace").split())
+                    why = "".join(c for c in text if c.isprintable())[:300] or f"exit {found.returncode}"
+                elif action == "fill":
+                    answer = found.stdout
+            except subprocess.TimeoutExpired:
+                why = "the host's git credential helper timed out"
+            except OSError as error:
+                why = str(error)
         if op.strip() == "get":
             try:
-                subprocess.run(self.exec_argv(CREDENTIAL_ANSWER, request_id), input=answer,
-                               capture_output=True, check=False)
+                subprocess.run(self.exec_argv(CREDENTIAL_ANSWER, request_id, *([why] if why else [])),
+                               input=answer, capture_output=True, check=False)
             except OSError:
                 pass
 
@@ -451,7 +515,7 @@ class Server:
                 host = {"0.0.0.0": "localhost", "::": "localhost", "::1": "[::1]"}.get(parts.hostname, parts.hostname)
                 parts = parts._replace(netloc=f"{host}:{host_port}")
         try:
-            subprocess.Popen([*host_opener(), urllib.parse.urlunsplit(parts)], stdin=subprocess.DEVNULL,
+            subprocess.Popen([*host_opener(), urllib.parse.urlunsplit(parts)], stdin=subprocess.DEVNULL, env=host_env(),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             pass
@@ -686,8 +750,7 @@ def last_json(raw):
 
 
 def log_file(row):
-    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-    folder = os.path.join(state, "hc-devcontainer")
+    folder = state_dir()
     os.makedirs(folder, exist_ok=True)
     # Unbuffered: the CLI writes to the same file.
     return open(os.path.join(folder, f"{row['name']}.log"), "wb", buffering=0)
@@ -1052,6 +1115,8 @@ def exists(docker, via):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     docker = os.environ.get("HC_DEVCONTAINER_DOCKER") or "docker"
+    if argv and argv[0] in ("ls", "start", "exists"):
+        remember_desktop()  # the app's own commands, from its desktop session
     if argv and argv[0] == "ls":
         parser = argparse.ArgumentParser(prog="hc-devcontainer ls")
         parser.add_argument("--all", action="store_true")

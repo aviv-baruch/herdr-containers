@@ -1228,7 +1228,8 @@ class BrowserTests(unittest.TestCase):
 
     def test_stop_ends_the_listener_and_run(self):
         server = helper.Server("docker", "abc", None)
-        listener = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        # exec: dash forks a plain `sleep`, which would keep stdout open after the kill.
+        listener = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     text=True)
         with patch.object(helper.subprocess, "Popen", return_value=listener) as popen, \
                 patch.object(server, "setup_credentials"):
@@ -1363,9 +1364,10 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(answer.kwargs["input"], b"username=me\npassword=tok\n")
         # A failed fill still answers, empty, so the container's git moves on.
         with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
-                patch.object(helper.subprocess, "run", return_value=done(code=128)) as run:
+                patch.object(helper.subprocess, "run", return_value=done(code=128, stderr=b"")) as run:
             server.credential("12-34", request.hex())
         self.assertEqual(run.call_args.kwargs["input"], b"")
+        self.assertEqual(run.call_args.args[0][-1], "exit 128")
         for op, action in (("store", "approve"), ("erase", "reject")):
             with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
                     patch.object(helper.subprocess, "run", return_value=done()) as run:
@@ -1377,6 +1379,78 @@ class CredentialTests(unittest.TestCase):
             with patch.object(helper.subprocess, "run") as run:
                 server.credential(request_id, encoded)
             run.assert_not_called()
+
+    def test_the_apps_desktop_session_reaches_host_git_and_links(self):
+        # Core may run outside the desktop session; GCM shows its window only with a display.
+        with tempfile.TemporaryDirectory() as state:
+            app = {"XDG_STATE_HOME": state, "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0",
+                   "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "OTHER": "not kept"}
+            with patch.dict(os.environ, app), patch.object(helper, "inspect", return_value=[]), \
+                    patch.object(helper, "ps", return_value=[]), redirect_stdout(io.StringIO()):
+                helper.main(["ls", "--json"])
+            saved = Path(state) / "hc-devcontainer" / "desktop.json"
+            self.assertEqual(json.loads(saved.read_text()), {
+                "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"})
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            # A run without a display (core's, or an ssh shell) keeps the record.
+            core = {"XDG_STATE_HOME": state, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/own"}
+            with patch.dict(os.environ, core):
+                for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+                    os.environ.pop(name, None)
+                with patch.object(helper, "inspect", return_value=[]), patch.object(helper, "ps", return_value=[]), \
+                        redirect_stdout(io.StringIO()):
+                    helper.main(["ls", "--json"])
+                env = helper.host_env()
+                self.assertEqual((env["DISPLAY"], env["WAYLAND_DISPLAY"]), (":0", "wayland-0"))
+                self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/own")  # its own wins
+                self.assertNotIn("OTHER", env)
+                server = helper.Server("docker", "abc", None)
+                with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
+                        patch.object(helper.subprocess, "run", return_value=done(b"password=x\n")) as run:
+                    server.credential("1-2", b"get\nprotocol=https\nhost=a.test\n".hex())
+                self.assertEqual(run.call_args_list[0].kwargs["env"]["DISPLAY"], ":0")
+                with patch.object(helper.subprocess, "Popen") as popen:
+                    server.open("https://example.test/")
+                self.assertEqual(popen.call_args.kwargs["env"]["WAYLAND_DISPLAY"], "wayland-0")
+
+    def test_why_the_host_could_not_answer_is_shown_in_the_container(self):
+        server = helper.Server("docker", "abc", None)
+        failed = done(code=1, stderr=b"fatal: Cannot prompt because\n  terminal prompts have been disabled.\x1b[0m\n")
+        with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
+                patch.object(helper.subprocess, "run", return_value=failed) as run:
+            server.credential("1-2", b"get\nprotocol=https\nhost=a.test\n".hex())
+        message = "fatal: Cannot prompt because terminal prompts have been disabled.[0m"
+        self.assertEqual(run.call_args.args[0], server.exec_argv(helper.CREDENTIAL_ANSWER, "1-2", message))
+        with patch.object(helper.shutil, "which", return_value=None), patch.object(helper.subprocess, "run") as run:
+            server.credential("1-2", b"get\nprotocol=https\nhost=a.test\n".hex())
+        self.assertIn("git is not installed on the host", run.call_args.args[0][-1])
+        # The container's helper prints it where git ran, then git moves on.
+        with tempfile.TemporaryDirectory() as home:
+            listener, folder = fake_listener(home)
+            try:
+                path = self.helper_file(folder)
+
+                def host():
+                    for _ in range(100):
+                        found = list((folder / "cred").glob("*.req"))
+                        if found:
+                            found[0].unlink()
+                            run_script(helper.CREDENTIAL_ANSWER, found[0].stem, "fatal: no display",
+                                       env={**os.environ, "HOME": home}, input="")
+                            return
+                        time.sleep(0.05)
+
+                thread = threading.Thread(target=host)
+                thread.start()
+                got = subprocess.run([str(path), "get"], input=b"protocol=https\nhost=a.test\n",
+                                     capture_output=True, timeout=10, check=False)
+                thread.join(5)
+            finally:
+                listener.kill()
+                listener.wait()
+            self.assertEqual((got.returncode, got.stdout), (0, b""))
+            self.assertEqual(got.stderr, b"herdr-containers: the host's git could not answer: fatal: no display\n")
+            self.assertEqual(list((folder / "cred").iterdir()), [])
 
     def test_setup_follows_vs_codes_setting(self):
         server = helper.Server("docker", "abc", "vscode")
