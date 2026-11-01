@@ -660,7 +660,15 @@ class WindowsHostTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    """The Dev Containers CLI path: what VS Code runs to open and attach to a dev container."""
+    """The Dev Containers CLI path: VS Code's own open and attach sequence."""
+
+    # Where run-user-commands stops for each (blocking, stop) phase, by waitFor.
+    PHASES = {
+        "updateContentCommand": {(True, True): "skipNonBlocking", (False, True): "stopForPersonalization",
+                                 (False, False): "done"},
+        "postStartCommand": {(True, True): "stopForPersonalization", (True, False): "skipNonBlocking",
+                             (False, False): "done"},
+    }
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -670,6 +678,15 @@ class CliTests(unittest.TestCase):
         (self.folder / ".devcontainer").mkdir(parents=True)
         self.config = self.folder / ".devcontainer" / "devcontainer.json"
         self.config.write_text("{}")
+        self.home = self.temp / "host-home"
+        (self.home / ".ssh").mkdir(parents=True)
+        (self.home / ".ssh" / "known_hosts").write_text("github.com ssh-ed25519 AAAA\n")
+        (self.home / ".gitconfig").write_text("[user]\n\tname = Me\n")
+        (self.home / ".config" / "git").mkdir(parents=True)
+        (self.home / ".config" / "git" / "config").write_text("[core]\n")
+        self.vscode = self.temp / "vscode-user"
+        self.vscode.mkdir()
+        self.settings = self.vscode / "settings.json"
         self.dev = {
             "Id": "dev-id", "Name": "/dev-work", "Created": "2026-10-30",
             "State": {"Status": "running", "Running": True},
@@ -679,10 +696,12 @@ class CliTests(unittest.TestCase):
                        "WorkingDir": "/fallback", "Image": "dev:latest"},
             "Mounts": [{"Source": str(self.folder), "Destination": "/workspaces/project"}],
         }
-        env = patch.dict(os.environ, {"HC_DEVCONTAINER_CLI": "devcontainer",
-                                      "XDG_STATE_HOME": str(self.temp / "state")})
+        env = patch.dict(os.environ, {"HC_DEVCONTAINER_CLI": "devcontainer", "HOME": str(self.home),
+                                      "XDG_STATE_HOME": str(self.temp / "state"),
+                                      "HC_DEVCONTAINER_VSCODE_USER": str(self.vscode)})
         env.start()
         self.addCleanup(env.stop)
+        os.environ.pop("XDG_CONFIG_HOME", None)
         which = patch.object(helper.shutil, "which", side_effect=lambda name: f"/bin/{name}")
         which.start()
         self.addCleanup(which.stop)
@@ -690,91 +709,199 @@ class CliTests(unittest.TestCase):
                        "--id-label", f"devcontainer.local_folder={self.folder}",
                        "--id-label", f"devcontainer.config_file={self.config}"]
 
-    def connect(self, argv, up_code=0, container=None):
+    def connect(self, argv, container=None, wait_for="updateContentCommand", up_code=0, copies=(),
+                gh_needs_login=False):
+        """Run a connection against fakes; returns the steps in order, '|' where the child forks."""
+        steps, calls = [], []
+
+        def run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:2] == ["devcontainer", "up"]:
+                steps.append("up")
+                return done(b'{"outcome":"success","remoteUser":"vscode"}\n', code=up_code)
+            if cmd[:2] == ["devcontainer", "run-user-commands"]:
+                key = ("--skip-non-blocking-commands" in cmd, "--stop-for-personalization" in cmd)
+                steps.append(f"hooks{key}")
+                return done(json.dumps({"outcome": "success", "result": self.PHASES[wait_for][key]}).encode())
+            if cmd[:2] == ["devcontainer", "exec"]:
+                steps.append("gh-login" if "--with-token" in cmd[-1] else "gh-check")
+                return done(code=0 if gh_needs_login else 1)
+            if cmd[:2] == ["gh", "auth"]:
+                steps.append("host-token")
+                return done(b"gho_token\n")
+            if cmd[:3] == ["git", "config", "--global"]:
+                return done(code=1)
+            if cmd[1] == "exec" and 'printf %s "$HOME"' in cmd:
+                return done(b"/home/vscode")
+            if cmd[1] == "exec":
+                script = cmd[cmd.index("-c") + 1]
+                name = "cleanup" if script == helper.GIT_CLEANUP else f"copy {cmd[-2]}"
+                steps.append(name)
+                return done(code=0 if name in copies else 1)
+            raise AssertionError(cmd)
+
         with patch.object(helper, "inspect", return_value=[container or self.dev]), \
                 patch.object(helper, "folder_ids", return_value=["dev-id"]), \
-                patch.object(helper.subprocess, "run", return_value=done(code=up_code)) as run, \
-                patch.object(helper.subprocess, "Popen") as popen, \
+                patch.object(helper.subprocess, "run", side_effect=run), \
+                patch.object(helper, "detach", side_effect=lambda work, log: (steps.append("|"), work())), \
                 patch.object(helper.os, "execvp") as execvp, \
                 patch.object(helper.os, "execvpe") as execvpe, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(helper.main(argv), 0)
-        return SimpleNamespace(run=run, popen=popen, execvp=execvp, execvpe=execvpe, errors=errors.getvalue())
+        return SimpleNamespace(steps=steps, calls=calls, execvp=execvp, execvpe=execvpe, errors=errors.getvalue())
 
-    def test_cli_comes_from_the_environment_or_path(self):
+    def engine(self, bin_dir):
+        """VS Code's record of its engine, as the extension writes it on activation."""
+        electron, extension = self.temp / "code" / "code", self.temp / "ext"
+        electron.parent.mkdir(exist_ok=True)
+        electron.write_text("#!/bin/sh\n")
+        electron.chmod(0o755)
+        script = extension / "dist" / "spec-node" / "devContainersSpecCLI.js"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("")
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "vscode-path").write_text(str(electron))
+        (bin_dir / "remote-containers-path").write_text(str(extension))
+        return [str(electron), str(script)]
+
+    def test_cli_comes_from_the_environment(self):
         with patch.object(helper.shutil, "which", side_effect=lambda name: f"/bin/{name}" if name != "missing" else None):
             for value, expected in (("devcontainer", ["devcontainer"]),
                                     ("node '/x/my cli.js'", ["node", "/x/my cli.js"]),
                                     ("", None), ("missing --flag", None)):
                 with self.subTest(value=value), patch.dict(os.environ, {"HC_DEVCONTAINER_CLI": value}):
                     self.assertEqual(helper.devcontainer_cli(), expected)
-            with patch.dict(os.environ):
-                del os.environ["HC_DEVCONTAINER_CLI"]
-                self.assertEqual(helper.devcontainer_cli(), ["devcontainer"])
             # cmd would re-parse the connection line through devcontainer.cmd.
             with patch.object(helper, "WINDOWS", True):
                 self.assertIsNone(helper.devcontainer_cli())
 
-    def test_folder_connect_opens_like_vs_code_then_execs_through_the_cli(self):
-        line = "printf 'hi'; echo \"$1\""
+    def test_vs_codes_own_engine_comes_before_a_devcontainer_command(self):
+        del os.environ["HC_DEVCONTAINER_CLI"]
+        os.environ.pop("ELECTRON_RUN_AS_NODE", None)
+        with patch.object(helper.shutil, "which", return_value=None):
+            self.assertIsNone(helper.devcontainer_cli())
+        with patch.object(helper.shutil, "which", return_value="/usr/bin/devcontainer"):
+            self.assertEqual(helper.devcontainer_cli(), ["devcontainer"])
+            self.assertNotIn("ELECTRON_RUN_AS_NODE", os.environ)
+            engine = self.engine(self.vscode / "globalStorage" / "ms-vscode-remote.remote-containers" / "cli-bin")
+            self.assertEqual(helper.devcontainer_cli(), engine)
+        self.assertEqual(os.environ["ELECTRON_RUN_AS_NODE"], "1")
+
+    def test_vs_codes_devcontainer_command_is_never_run_itself(self):
+        # It has only open and build; the files beside it name the engine.
+        del os.environ["HC_DEVCONTAINER_CLI"]
+        shim = self.temp / "cli-bin" / "devcontainer"
+        with patch.object(helper.shutil, "which", return_value=str(shim)):
+            shim.parent.mkdir()
+            (shim.parent / "vscode-path").write_text(str(self.temp / "gone"))
+            self.assertIsNone(helper.devcontainer_cli())
+            engine = self.engine(shim.parent)
+            self.assertEqual(helper.devcontainer_cli(), engine)
+
+    def test_default_wait_for_connects_after_update_content_and_personalizes_in_the_background(self):
+        got = self.connect([str(self.folder), "true"])
+        known_hosts, gitconfig = "/home/vscode/.ssh/known_hosts", "/home/vscode/.gitconfig"
+        self.assertEqual(got.steps, [
+            "up", f"copy {known_hosts}", "hooks(True, True)", "|",
+            "gh-check", "hooks(False, True)", f"copy {gitconfig}", "copy /home/vscode/.config/git/config",
+            "hooks(False, False)"])
+        got.execvp.assert_called_once()
+
+    def test_wait_for_past_post_create_personalizes_before_connecting(self):
+        got = self.connect([str(self.folder), "true"], wait_for="postStartCommand")
+        self.assertEqual(got.steps, [
+            "up", "copy /home/vscode/.ssh/known_hosts", "hooks(True, True)", "copy /home/vscode/.gitconfig",
+            "copy /home/vscode/.config/git/config", "hooks(True, False)", "|", "gh-check", "hooks(False, False)"])
+
+    def test_cli_calls_name_the_container_its_config_and_vs_code_settings(self):
+        self.settings.write_text("""{
+            // VS Code writes comments and trailing commas
+            "dotfiles.repository": "https://example.com/me/dotfiles.git", /* a URL holds // */
+            "dotfiles.targetPath": "~/dots",
+            "dotfiles.installCommand": "",
+        }""")
         with patch.dict(os.environ, {"HC_DEVCONTAINER_DOCKER": "podman"}):
-            got = self.connect([str(self.folder), line])
+            got = self.connect([str(self.folder), "printf hi"])
         common = ["--docker-path", "podman"]
-        # Blocking hooks (up to waitFor) first, like VS Code before it connects its window ...
-        got.run.assert_called_once_with(
-            ["devcontainer", "up", *common, *self.target, "--expect-existing-container", "--skip-non-blocking-commands"],
-            stdin=helper.subprocess.DEVNULL, stdout=2, check=False)
-        # ... then postCreate/postStart/postAttach in the background, logged.
-        argv, kwargs = got.popen.call_args.args[0], got.popen.call_args.kwargs
-        self.assertEqual(argv, ["devcontainer", "run-user-commands", *common, *self.target])
-        self.assertEqual(kwargs["stdin"], helper.subprocess.DEVNULL)
-        self.assertTrue(kwargs["start_new_session"])
-        self.assertEqual(kwargs["stdout"].name, str(self.temp / "state" / "hc-devcontainer" / "dev-work.log"))
+        up = next(cmd for cmd, _ in got.calls if cmd[1] == "up")
+        self.assertEqual(up, ["devcontainer", "up", *common, *self.target, "--expect-existing-container",
+                              "--skip-post-create"])
+        hooks = [cmd for cmd, _ in got.calls if cmd[1] == "run-user-commands"]
+        session = hooks[0][hooks[0].index("--container-session-data-folder") + 1]
+        self.assertRegex(session, r"^/tmp/devcontainers-[0-9a-f-]{36}$")
+        self.assertEqual(hooks[0][:-1], [
+            "devcontainer", "run-user-commands", *common, "--container-id", "dev-id", *self.target,
+            "--remote-env", "REMOTE_CONTAINERS=true", "--container-session-data-folder", session,
+            "--dotfiles-repository", "https://example.com/me/dotfiles.git", "--dotfiles-target-path", "~/dots",
+            "--skip-non-blocking-commands"])
+        self.assertTrue(all(session in cmd for cmd in hooks))
         # The CLI sets the user, userEnvProbe env, remoteEnv and the workspace folder itself.
         got.execvp.assert_called_once_with("devcontainer", [
             "devcontainer", "exec", *common, "--container-id", "dev-id", *self.target,
-            "sh", "-c", helper.WRAPPER, "sh", line])
-        got.execvpe.assert_not_called()
+            "--remote-env", "REMOTE_CONTAINERS=true", "sh", "-c", helper.WRAPPER, "sh", "printf hi"])
+        # Copies run as the remoteUser up reported, with the host file on stdin.
+        copy = next((cmd, kw) for cmd, kw in got.calls if cmd[:2] == ["podman", "exec"] and cmd[-1] == "ssh")
+        self.assertEqual(copy[0][:6], ["podman", "exec", "-i", "-u", "vscode", "dev-id"])
+        self.assertEqual(copy[1]["input"], b"github.com ssh-ed25519 AAAA\n")
+        log = self.temp / "state" / "hc-devcontainer" / "dev-work.log"
+        self.assertIn(b"remoteUser", log.read_bytes())
+
+    def test_copied_git_config_is_cleaned_up_and_settings_can_turn_copying_off(self):
+        got = self.connect([str(self.folder), "true"], copies=("copy /home/vscode/.gitconfig",))
+        self.assertIn("cleanup", got.steps)
+        gitconfig = next(kw for cmd, kw in got.calls if cmd[-2:] == ["/home/vscode/.gitconfig", "git"])
+        self.assertEqual(gitconfig["input"], b"[user]\n\tname = Me\n")
+        self.settings.write_text('{"dev.containers.copyGitConfig": false}')
+        got = self.connect([str(self.folder), "true"])
+        self.assertFalse([step for step in got.steps if "gitconfig" in step or "git/config" in step])
+
+    def test_gh_logs_in_with_the_host_token_only_where_it_is_logged_out(self):
+        got = self.connect([str(self.folder), "true"], gh_needs_login=True)
+        self.assertEqual(got.steps[got.steps.index("|") + 1:][:3], ["gh-check", "host-token", "gh-login"])
+        login = next(kw for cmd, kw in got.calls if cmd[-1] == "gh auth login --with-token")
+        self.assertEqual(login["input"], b"gho_token")
+        self.settings.write_text('{"dev.containers.githubCLILoginWithToken": false}')
+        got = self.connect([str(self.folder), "true"], gh_needs_login=True)
+        self.assertNotIn("gh-check", got.steps)
 
     def test_failed_up_still_connects_by_container_id(self):
         got = self.connect([str(self.folder), "true"], up_code=1)
-        got.popen.assert_not_called()
+        self.assertFalse([step for step in got.steps if step.startswith("hooks")])
+        self.assertIn("copy /home/vscode/.gitconfig", got.steps)
         got.execvp.assert_called_once_with("devcontainer", [
             "devcontainer", "exec", "--docker-path", "docker", "--container-id", "dev-id",
-            "sh", "-c", helper.WRAPPER, "sh", "true", "/workspaces/project"])
+            "--remote-env", "REMOTE_CONTAINERS=true", "sh", "-c", helper.WRAPPER, "sh", "true", "/workspaces/project"])
         self.assertIn("lifecycle commands skipped", got.errors)
 
     def test_a_cli_that_cannot_run_falls_back_to_docker_exec(self):
         # e.g. the npm shim's `env node` without node on core's PATH.
         got = self.connect([str(self.folder), "true"], up_code=127)
-        got.popen.assert_not_called()
+        self.assertEqual(got.steps, ["up"])
         got.execvp.assert_not_called()
         self.assertEqual(got.execvpe.call_args.args[1][:2], ["docker", "exec"])
         self.assertIn("using docker exec", got.errors)
 
-    def test_without_the_config_on_this_host_only_exec_runs(self):
+    def test_without_the_config_on_this_host_there_are_no_lifecycle_commands(self):
         self.config.unlink()
         got = self.connect([str(self.folder), "true"])
-        got.run.assert_not_called()
-        got.popen.assert_not_called()
-        self.assertEqual(got.execvp.call_args.args[1][:6],
-                         ["devcontainer", "exec", "--docker-path", "docker", "--container-id", "dev-id"])
+        self.assertFalse([step for step in got.steps if step in ("up",) or step.startswith("hooks")])
         self.assertEqual(got.execvp.call_args.args[1][-3:], ["sh", "true", "/workspaces/project"])
 
     def test_legacy_label_execs_by_container_id_without_lifecycle(self):
         legacy = copy.deepcopy(self.dev)
         legacy["Config"]["Labels"] = {"vsch.local.folder": str(self.folder)}
         got = self.connect([str(self.folder), "true"], container=legacy)
-        got.run.assert_not_called()
+        self.assertNotIn("up", got.steps)
         self.assertNotIn("--workspace-folder", got.execvp.call_args.args[1])
 
-    def test_plain_container_execs_through_the_cli(self):
+    def test_plain_container_attaches_through_the_cli(self):
         plain = {"Id": "plain-id", "Name": "/web", "State": {"Status": "running"},
-                 "Config": {"Labels": {}, "WorkingDir": "/app"}}
+                 "Config": {"Labels": {}, "WorkingDir": "/app", "User": "app"}}
         got = self.connect(["--container", "web", "true"], container=plain)
-        got.run.assert_not_called()
+        self.assertEqual(got.steps, ["copy /home/vscode/.ssh/known_hosts", "copy /home/vscode/.gitconfig",
+                                     "copy /home/vscode/.config/git/config", "|", "gh-check"])
         got.execvp.assert_called_once_with("devcontainer", [
             "devcontainer", "exec", "--docker-path", "docker", "--container-id", "web",
-            "sh", "-c", helper.WRAPPER, "sh", "true", "/app"])
+            "--remote-env", "REMOTE_CONTAINERS=true", "sh", "-c", helper.WRAPPER, "sh", "true", "/app"])
 
     def test_start_opens_folder_dev_containers_like_vs_code(self):
         stopped = copy.deepcopy(self.dev)
@@ -784,12 +911,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(helper.main(["start", "dev-id"]), 0)
         run.assert_called_once_with(
             ["devcontainer", "up", "--docker-path", "docker", *self.target,
-             "--expect-existing-container", "--skip-non-blocking-commands"],
-            stdin=helper.subprocess.DEVNULL, capture_output=True, text=True, check=False)
+             "--expect-existing-container", "--skip-post-create"],
+            stdin=helper.subprocess.DEVNULL, capture_output=True, check=False)
 
     def test_start_falls_back_to_docker_start(self):
         stopped = copy.deepcopy(self.dev)
-        failed = done(code=1, stdout='{"outcome":"error","message":"bad config"}')
+        failed = done(code=1, stdout=b'{"outcome":"error","message":"bad config"}', stderr=b"")
         with patch.object(helper, "inspect", return_value=[stopped]), \
                 patch.object(helper.subprocess, "run", side_effect=[failed, done()]) as run, \
                 redirect_stderr(io.StringIO()) as errors:
@@ -807,6 +934,61 @@ class CliTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as output:
                 helper.main(["ls", "--all", "--json"])
         self.assertNotIn("cli_labels", json.loads(output.getvalue())[0])
+
+
+class VsCodeScriptTests(unittest.TestCase):
+    """VS Code's in-container snippets, run by a real sh."""
+
+    def copy(self, target, needs="sh", in_use="", data=b"host\n"):
+        script = helper.COPY.format(in_use=in_use)
+        return subprocess.run(["sh", "-c", script, "sh", str(target), needs], input=data, check=False).returncode
+
+    def test_copy_only_where_none_is_and_the_reader_exists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "new dir" / "file"
+            self.assertEqual(self.copy(target), 0)
+            self.assertEqual(target.read_bytes(), b"host\n")
+            self.assertEqual(self.copy(target, data=b"again\n"), 1)
+            self.assertEqual(target.read_bytes(), b"host\n")
+            self.assertEqual(self.copy(Path(temp) / "other", needs="no-such-command-here"), 1)
+            self.assertFalse((Path(temp) / "other").exists())
+
+    def test_gitconfig_with_only_filter_or_safe_sections_gets_the_host_appended(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / ".gitconfig"
+            target.write_text("[safe]\n\tdirectory = *\n[filter \"lfs\"]\n\tclean = x\n")
+            self.assertEqual(self.copy(target, in_use=helper.GITCONFIG_IN_USE), 0)
+            self.assertTrue(target.read_text().endswith("host\n"))
+            target.write_text("[user]\n\tname = Them\n")
+            self.assertEqual(self.copy(target, in_use=helper.GITCONFIG_IN_USE), 1)
+            self.assertEqual(target.read_text(), "[user]\n\tname = Them\n")
+
+    def test_settings_jsonc(self):
+        text = '{ // c\n "a": "x // not a comment, }", /* block */ "b": [1, 2,], "c": "q\\"//",\n}'
+        self.assertEqual(json.loads(helper.jsonc(text)), {"a": "x // not a comment, }", "b": [1, 2], "c": 'q"//'})
+
+    def test_detached_work_holds_none_of_the_connection_pipes(self):
+        # The parent returns at once and core's stdout closes when it exits, while the child works on.
+        with tempfile.TemporaryDirectory() as temp:
+            marker, log = Path(temp) / "marker", Path(temp) / "log"
+            code = (f"import importlib.machinery, importlib.util, sys, time\n"
+                    f"loader = importlib.machinery.SourceFileLoader('h', {str(path)!r})\n"
+                    f"spec = importlib.util.spec_from_loader('h', loader); h = importlib.util.module_from_spec(spec)\n"
+                    f"loader.exec_module(h)\n"
+                    f"def work():\n    time.sleep(0.5); print('child'); open({str(marker)!r}, 'w').close()\n"
+                    f"h.detach(work, open({str(log)!r}, 'wb', buffering=0))\n"
+                    f"print('parent')\n")
+            started = __import__("time").monotonic()
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True, timeout=5)
+            elapsed = __import__("time").monotonic() - started
+            self.assertEqual(result.stdout, "parent\n")
+            self.assertLess(elapsed, 0.45)
+            for _ in range(50):
+                if marker.exists():
+                    break
+                __import__("time").sleep(0.05)
+            self.assertTrue(marker.exists())
+            self.assertEqual(log.read_text(), "child\n")
 
 
 if __name__ == "__main__":
