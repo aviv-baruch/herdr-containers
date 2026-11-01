@@ -1112,8 +1112,12 @@ class BrowserTests(unittest.TestCase):
                 proc.stdin.close()
                 self.assertNotEqual(proc.wait(timeout=5), 0)
             finally:
+                # Not communicate(): before 3.13 it flushes the closed stdin and raises.
                 proc.kill()
-                proc.communicate()
+                proc.wait()
+                proc.stdout.close()
+                if not proc.stdin.closed:
+                    proc.stdin.close()
             # Its lock now names a dead process: the next listener takes over.
             proc = subprocess.Popen(["/bin/sh", "-c", helper.LISTEN], env={**os.environ, "HOME": home},
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
