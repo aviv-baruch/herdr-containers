@@ -625,15 +625,36 @@ class WindowsHostTests(unittest.TestCase):
         run.assert_called_once_with(helper.exec_argv("docker", "id", "me", "true", {}, "/w"),
                                     env=dict(os.environ), check=False)
 
-    def test_windows_launcher_runs_the_helper_beside_it(self):
+    def test_windows_cmd_launcher_runs_the_helper_beside_it(self):
         root = Path(__file__).resolve().parents[1]
-        launcher = (root / "requirements" / "hc-devcontainer.cmd").read_text(encoding="utf-8")
-        self.assertIn('"%~dp0hc-devcontainer" %*', launcher)
+        launcher = (root / "requirements" / "windows" / "hc-devcontainer.cmd").read_text(encoding="utf-8")
+        self.assertIn('"%~dp0hc-devcontainer.py" %*', launcher)
         self.assertIn("exit /b", launcher)
         self.assertNotIn("/dev/null", launcher)
-        attributes = (root / ".gitattributes").read_text(encoding="utf-8")
-        self.assertIn("*.cmd text eol=crlf", attributes.splitlines())
+        attributes = (root / ".gitattributes").read_text(encoding="utf-8").splitlines()
+        self.assertIn("*.cmd text eol=crlf", attributes)
+        self.assertIn("requirements/windows/hc-devcontainer text eol=lf", attributes)
 
+    def test_windows_sh_launcher_passes_args_untouched_to_the_helper_beside_it(self):
+        # Core on Windows runs a via with Git for Windows' sh, which can't use the helper's python3 shebang.
+        launcher = Path(__file__).resolve().parents[1] / "requirements" / "windows" / "hc-devcontainer"
+        with tempfile.TemporaryDirectory() as temp:
+            bin_dir, fake = Path(temp) / "bin", Path(temp) / "fake"
+            bin_dir.mkdir()
+            fake.mkdir()
+            shutil.copy(launcher, bin_dir / "hc-devcontainer")
+            (bin_dir / "hc-devcontainer.py").write_text(
+                "import json, os, sys\n"
+                "print(json.dumps([sys.argv[1:], os.environ.get('MSYS_NO_PATHCONV'), os.environ.get('MSYS2_ARG_CONV_EXCL')]))\n")
+            (fake / "py").write_text(f'#!/bin/sh\n[ "$1" = -3 ] || exit 9\nshift\nexec {shlex.quote(sys.executable)} "$@"\n')
+            (fake / "py").chmod(0o755)
+            line = """sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x "$p" ] || exit 127'"""
+            via = f"{bin_dir}/hc-devcontainer 'c:\\Users\\Me\\My Proj'"
+            env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+            # Exactly how core runs a via: sh -c '<via> "$1"' sh <line>.
+            result = subprocess.run(["sh", "-c", f'{via} "$1"', "sh", line], env=env,
+                                    capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), [["c:\\Users\\Me\\My Proj", line], "1", "*"])
 
 if __name__ == "__main__":
     unittest.main()

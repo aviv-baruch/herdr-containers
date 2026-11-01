@@ -657,7 +657,7 @@ test("on Windows core's refusal of --via machines is explained on Connect and Re
   const a = app();
   a.win.platform = "windows";
   const refused = { code: 1, stdout: JSON.stringify({ error: { message: "bad command \"hc-devcontainer 'c:\\\\w'\": one line, run by sh here" } }) };
-  const explained = "Herdr Core on Windows can't connect to containers (it has no --via); use Herdr in WSL, Linux or macOS";
+  const explained = "This Herdr Core refuses --via machines on Windows, so it can't connect containers; see the README's Windows section";
   a.setHc(async () => refused);
   const row = { id: "dev-id", name: "dev", kind: "devcontainer", state: "running", via: "hc-devcontainer 'c:\\w'", suggested_name: "dev" };
   a.view.open(row, a.cx);

@@ -47,11 +47,11 @@ function errorText(r) {
   return (r.stderr || r.stdout || "it didn't answer").trim();
 }
 
-// Herdr Core on Windows refuses every --via machine (herdr-core machines.rs check_target).
+// Released Herdr Core on Windows refuses every --via machine (herdr-core machines.rs check_target).
 function addError(r) {
   const text = errorText(r);
   return onWindows() && /run by sh here/.test(text)
-    ? "Herdr Core on Windows can't connect to containers (it has no --via); use Herdr in WSL, Linux or macOS"
+    ? "This Herdr Core refuses --via machines on Windows, so it can't connect containers; see the README's Windows section"
     : text;
 }
 

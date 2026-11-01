@@ -22,9 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Windows: the panel runs the helper through `cmd` and the new
-  `hc-devcontainer.cmd` launcher, since Windows can't start the Python script by
-  name; Docker Desktop being down reads as "Docker isn't running"; and Connect
-  and Repair explain that Herdr Core on Windows has no `--via` machines.
+  `requirements/windows` launchers (`hc-devcontainer.cmd` for the app, and an
+  `hc-devcontainer` sh script for core's via under Git for Windows), since
+  Windows can't start the Python script by name. Docker Desktop being down
+  reads as "Docker isn't running". When core refuses `--via` on Windows,
+  Connect and Repair say so.
 - Dev containers made by Docker Desktop on Windows find their workspace, folder
   and machine name: the helper matches Windows folder labels to Docker
   Desktop's and WSL's mount paths, ignoring case.
