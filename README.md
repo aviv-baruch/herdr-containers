@@ -166,6 +166,8 @@ Click a group header to collapse its rows while retaining the count. Click the C
 
 The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell) and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
 
+Links work like VS Code's. While Herdr is connected, the container's `BROWSER` points to a helper that opens each http(s) URL with the host's browser (`wslview` or `explorer.exe` on WSL, `xdg-open` on Linux, `open` on macOS, `explorer.exe` on Windows), unless its config sets `BROWSER` itself. Ports the container listens on (localhost or all interfaces) are forwarded to the same port on the host's `127.0.0.1`, so clicked `http://localhost:3000` links and login callbacks reach the container. A port already taken on the host is forwarded to a free one, which only links opened through `BROWSER` follow. Forwarding runs over `docker exec` and needs `python3`, `bash`, or `nc` in the container. A core that was already running keeps its old environment, so `BROWSER` arrives after the core restarts (restart the container or run `hc machine update <machine>`). On WSL, if links outside containers fail too, install `wslu` so the app's `xdg-open` reaches Windows.
+
 ## For agents
 
 Read [AGENTS.md](AGENTS.md). Task skills are in [`.agents/skills`](.agents/skills); `.claude/skills` points there.

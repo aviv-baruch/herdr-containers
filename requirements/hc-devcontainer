@@ -8,8 +8,12 @@ import posixpath
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import threading
+import time
+import urllib.parse
 
 FOLDER_LABELS = ("devcontainer.local_folder", "vsch.local.folder")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -103,6 +107,289 @@ def machine_name(folder):
     return name
 
 
+# $BROWSER in the container: queue each URL for `serve` on the host. Without a
+# live listener, print it so it can still be clicked.
+BROWSER_HELPER = """#!/bin/sh
+dir=$(dirname -- "$0")
+pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
+    tr '\\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q hc-devcontainer-serve || {
+    printf 'Open this link: %s\\n' "$@" >&2
+    exit 1
+}
+for url do printf '%s\\n' "$url" >>"$dir/open"; done
+"""
+
+# One listener per container user (hc-devcontainer-serve marks its cmdline).
+# Prints "open URL" and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
+# Exit 3: another runs; 4: no home to work in.
+LISTEN = """# hc-devcontainer-serve
+umask 077
+dir="$HOME/.cache/herdr-containers"
+lock="$dir/serve.lock"
+mkdir -p "$dir" 2>/dev/null || exit 4
+if ! mkdir "$lock" 2>/dev/null; then
+    pid=$(cat "$lock/pid" 2>/dev/null) || exit 3
+    tr '\\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q hc-devcontainer-serve && exit 3
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || exit 3
+fi
+echo $$ >"$lock/pid"
+# docker exec keeps a process whose client left; only its stdin closes.
+# (A background job's stdin is /dev/null, so hand it over as fd 3.)
+exec 3<&0
+(cat <&3 >/dev/null; kill $$) &
+exec 3<&-
+rm -f "$dir/open"
+last=
+while :; do
+    if [ -s "$dir/open" ] && mv -f "$dir/open" "$dir/open.$$" 2>/dev/null; then
+        sed 's/^/open /' "$dir/open.$$" || exit 0
+        rm -f "$dir/open.$$"
+    fi
+    ports=$(awk '$4 == "0A" { print $2 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr '\\n' ' ')
+    if [ "$ports" != "$last" ]; then
+        echo "ports $ports" || exit 0
+        last=$ports
+    fi
+    sleep 1
+done
+"""
+
+# Carries one forwarded TCP connection over docker exec's stdin and stdout.
+RELAY = """if command -v python3 >/dev/null 2>&1; then
+    exec python3 -c '
+import os, socket, sys, threading
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])))
+def up():
+    while data := sys.stdin.buffer.read1(65536):
+        s.sendall(data)
+    s.shutdown(socket.SHUT_WR)
+threading.Thread(target=up, daemon=True).start()
+while data := s.recv(65536):
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+os._exit(0)  # the stdin thread would abort a normal exit
+' "$1" "$2"
+elif command -v bash >/dev/null 2>&1; then
+    # The server's side ends the relay; stdin goes over fd 4 (see LISTEN).
+    exec bash -c 'exec 3<>"/dev/tcp/$1/$2" 4<&0 || exit 1; cat <&4 >&3 & exec 4<&-; cat <&3; kill $!' \
+        bash "$1" "$2"
+elif command -v nc >/dev/null 2>&1; then
+    # Some nc builds outlast the server until stdin closes too.
+    exec nc "$1" "$2"
+fi
+exit 127
+"""
+
+# /proc/net/tcp* local addresses worth forwarding: wildcard and loopback.
+LOOPBACK = {"00000000": "127.0.0.1", "0100007F": "127.0.0.1", "0" * 32: "::1",
+            "00000000000000000000000001000000": "::1", "0000000000000000FFFF00000100007F": "127.0.0.1"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "::"}
+
+
+def listening(ports_line):
+    """{port: address to dial} for loopback and wildcard listeners."""
+    found = {}
+    for item in ports_line.split():
+        address, _, port = item.partition(":")
+        target = LOOPBACK.get(address.upper())
+        try:
+            number = int(port, 16)
+        except ValueError:
+            continue
+        if target and number:
+            found.setdefault(number, target)
+    return found
+
+
+def host_opener():
+    if os.environ.get("HC_DEVCONTAINER_OPEN"):
+        return shlex.split(os.environ["HC_DEVCONTAINER_OPEN"])
+    if WINDOWS:
+        return ["explorer.exe"]
+    if sys.platform == "darwin":
+        return ["open"]
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as stream:
+            wsl = "microsoft" in stream.read().lower()
+    except OSError:
+        wsl = False
+    if wsl:
+        # The Windows browser, as VS Code uses; WSL forwards localhost to it.
+        found = shutil.which("wslview") or shutil.which("explorer.exe")
+        if found or os.path.exists("/mnt/c/Windows/explorer.exe"):
+            return [found or "/mnt/c/Windows/explorer.exe"]
+    return ["xdg-open"]
+
+
+class Server:
+    """Opens the container's links here and forwards its listening ports."""
+
+    def __init__(self, docker, container, user):
+        self.docker, self.container, self.user = docker, container, user
+        self.forwards = {}  # container port: (listening socket, host port)
+        self.targets = {}
+        self.lock = threading.Lock()
+        self.proc = None
+        self.stopped = False
+
+    def exec_argv(self, script, *args):
+        return [self.docker, "exec", "-i", *(["-u", self.user] if self.user else []),
+                self.container, "sh", "-c", script, "sh", *args]
+
+    def relay(self, client, port):
+        target = self.targets.get(port, "127.0.0.1")
+        try:
+            proc = subprocess.Popen(self.exec_argv(RELAY, target, str(port)), stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            client.close()
+            return
+
+        def up():
+            try:
+                while data := client.recv(65536):
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=up, daemon=True).start()
+        try:
+            while data := proc.stdout.read1(65536):
+                client.sendall(data)
+        except OSError:
+            pass
+        finally:
+            # close() alone leaves the up thread's recv() holding the connection open.
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+
+    def accept(self, listener, port):
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.relay, args=(client, port), daemon=True).start()
+
+    def forward(self, port):
+        """The host port that reaches the container's port, or None."""
+        with self.lock:
+            if port in self.forwards:
+                return self.forwards[port][1]
+            # Same port first: clicked links and OAuth callbacks name it.
+            for host_port in (port, 0):
+                listener = socket.socket()
+                try:
+                    listener.bind(("127.0.0.1", host_port))
+                    listener.listen()
+                except OSError:
+                    listener.close()
+                    continue
+                bound = listener.getsockname()[1]
+                self.forwards[port] = (listener, bound)
+                threading.Thread(target=self.accept, args=(listener, port), daemon=True).start()
+                return bound
+        return None
+
+    def ports(self, line):
+        found = listening(line)
+        self.targets.update(found)
+        with self.lock:
+            gone = [port for port in self.forwards if port not in found]
+            for port in gone:
+                listener = self.forwards.pop(port)[0]
+                try:
+                    listener.shutdown(socket.SHUT_RDWR)  # wakes accept(); close() would not
+                except OSError:
+                    pass
+                listener.close()
+        for port in found:
+            self.forward(port)
+
+    def open(self, url):
+        try:
+            parts = urllib.parse.urlsplit(url.strip())
+            port = parts.port
+        except ValueError:
+            return
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return
+        if parts.hostname in LOCAL_HOSTS:
+            host_port = self.forward(port or (443 if parts.scheme == "https" else 80))
+            if host_port:
+                host = {"0.0.0.0": "localhost", "::": "localhost", "::1": "[::1]"}.get(parts.hostname, parts.hostname)
+                parts = parts._replace(netloc=f"{host}:{host_port}")
+        try:
+            subprocess.Popen([*host_opener(), urllib.parse.urlunsplit(parts)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+
+    def listen_once(self):
+        """Runs one listener to its end; returns its exit code."""
+        with self.lock:
+            if self.stopped:
+                return 4
+            proc = self.proc = subprocess.Popen(self.exec_argv(LISTEN), stdin=subprocess.PIPE,
+                                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in proc.stdout:
+            kind, _, rest = line.rstrip("\n").partition(" ")
+            if kind == "open":
+                self.open(rest)
+            elif kind == "ports":
+                self.ports(rest)
+        proc.stdout.close()
+        return proc.wait()
+
+    def run(self):
+        """Keeps one listener running until stop(), or until there is no home."""
+        while self.listen_once() != 4:
+            self.ports("")
+            time.sleep(2)
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+            if self.proc:
+                self.proc.kill()
+
+
+def serve(docker, container, user, parent):
+    """Serves until the connection process `parent` ends (POSIX reparents us)."""
+    server = Server(docker, container, user)
+
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(1)
+        server.stop()
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+    server.run()
+
+
+def serve_in_background(docker, container_id, user):
+    # A child of this process, which becomes the connection's docker exec.
+    try:
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "serve", container_id,
+                          user or "", str(os.getpid())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
 def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
     # Core starts terminals in its own folder when Herdr names none; the image's
     # WORKDIR is often empty (/), so start in the workspace when it exists.
@@ -118,6 +405,16 @@ def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
 fi
 # stdout carries the connection: cd must never print.
 [ "$#" -lt 2 ] || cd -- "$2" >/dev/null 2>&1 || :
+# Like VS Code's helper: programs hand links to the host (see serve).
+# Private: another user who could edit it would run code as this one.
+dir="${HOME:-/nonexistent}/.cache/herdr-containers"
+if [ -z "${BROWSER:-}" ] && (umask 077 && mkdir -p "$dir" && cat >"$dir/browser.$$" <<'HC_BROWSER' &&
+""" + BROWSER_HELPER + """HC_BROWSER
+        chmod 700 "$dir" && chmod 755 "$dir/browser.$$" && mv -f "$dir/browser.$$" "$dir/browser") 2>/dev/null; then
+    export BROWSER="$dir/browser"
+fi
+rm -f "$dir/browser.$$" 2>/dev/null
+unset dir
 exec sh -c "$1"
 """
     return [docker, "exec", "-i", *(["-u", user] if user else []),
@@ -135,7 +432,14 @@ def exec_container(docker, row, container_id, line):
     argv = exec_argv(docker, container_id, row["user"], line, remote, row.get("workspace"))
     if WINDOWS:
         # Windows has no exec: os.exec* starts a child and exits at once, ending the connection.
-        return subprocess.run([executable, *argv[1:]], env=env, check=False).returncode
+        # Its children are not reparented either, so serve in this process instead.
+        server = Server(docker, container_id, row["user"])
+        threading.Thread(target=server.run, daemon=True).start()
+        try:
+            return subprocess.run([executable, *argv[1:]], env=env, check=False).returncode
+        finally:
+            server.stop()
+    serve_in_background(docker, container_id, row["user"])
     os.execvpe(executable, argv, env)
 
 
@@ -304,6 +608,16 @@ def main(argv=None):
         parser.add_argument("id")
         args = parser.parse_args(argv[1:])
         run([docker, "start", args.id])
+        return 0
+
+    if argv and argv[0] == "serve":
+        parser = argparse.ArgumentParser(prog="hc-devcontainer serve",
+                                         description="Internal: open a connection's links and forward its ports.")
+        parser.add_argument("id")
+        parser.add_argument("user")
+        parser.add_argument("parent", type=int)
+        args = parser.parse_args(argv[1:])
+        serve(docker, args.id, args.user or None, args.parent)
         return 0
 
     if argv and argv[0] == "exists":

@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Links from containers open on the host like in VS Code, including from
+  WSL: `BROWSER` hands URLs to the host's browser and the container's
+  listening ports are forwarded to the same host ports, so `localhost` links
+  and login callbacks reach it. Needs a core restart to set `BROWSER`.
 - Windows: the panel runs the helper through `cmd` and the new
   `requirements/windows` launchers (`hc-devcontainer.cmd` for the app, and an
   `hc-devcontainer` sh script for core's via under Git for Windows), since
