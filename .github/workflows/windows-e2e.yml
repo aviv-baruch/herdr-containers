@@ -27,8 +27,7 @@ jobs:
           Get-Command py -ErrorAction SilentlyContinue
           Get-Content -Raw requirements\windows\hc-devcontainer.cmd | Format-Hex | Select-Object -First 2
       - name: Helper Windows tests, natively on Windows
-        working-directory: test
-        run: python -I -B -m unittest -v test_hc_devcontainer.WindowsHostTests
+        run: python -I -B -m unittest discover -v -s test -p test_hc_devcontainer.py -k WindowsHostTests
       - name: Whole helper suite on Windows (Linux-only tests expected to fail)
         continue-on-error: true
         run: python -I -B -m unittest discover -s test -p test_hc_devcontainer.py
