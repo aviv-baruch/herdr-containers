@@ -49,10 +49,19 @@ jobs:
           path: herdr-core
           submodules: true
           persist-credentials: false
-      # herdr-core's own CI: its vendored Ghostty builds with Zig.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
+      # herdr-core's vendored Ghostty builds with Zig 0.16. Third-party setup
+      # actions aren't allowed here: fetch it, checked against ziglang.org's index.
+      - name: Zig 0.16.0
+        run: |
+          $index = Invoke-RestMethod https://ziglang.org/download/index.json
+          $zig = $index.'0.16.0'.'x86_64-windows'
+          Invoke-WebRequest $zig.tarball -OutFile "$env:RUNNER_TEMP\zig.zip"
+          $sum = (Get-FileHash "$env:RUNNER_TEMP\zig.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($sum -ne $zig.shasum) { throw "zig checksum $sum != $($zig.shasum)" }
+          Expand-Archive "$env:RUNNER_TEMP\zig.zip" "$env:RUNNER_TEMP\zig"
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\zig" -Directory | Select-Object -First 1).FullName
+          Add-Content $env:GITHUB_PATH $bin
+          & "$bin\zig.exe" version
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # tag=v7.1.0
         with:
           python-version: '3.12'
