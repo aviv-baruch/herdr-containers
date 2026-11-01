@@ -21,6 +21,8 @@ loader = importlib.machinery.SourceFileLoader("hc_devcontainer", str(path))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 helper = importlib.util.module_from_spec(spec)
 loader.exec_module(helper)
+# The docker exec fallback, whatever this machine has; CliTests turn the Dev Containers CLI on.
+os.environ["HC_DEVCONTAINER_CLI"] = ""
 
 
 def done(stdout="", code=0, stderr=""):
@@ -655,6 +657,157 @@ class WindowsHostTests(unittest.TestCase):
             result = subprocess.run(["sh", "-c", f'{via} "$1"', "sh", line], env=env,
                                     capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(result.stdout), [["c:\\Users\\Me\\My Proj", line], "1", "*"])
+
+
+class CliTests(unittest.TestCase):
+    """The Dev Containers CLI path: what VS Code runs to open and attach to a dev container."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.temp = Path(temp.name)
+        self.folder = self.temp / "My Project"
+        (self.folder / ".devcontainer").mkdir(parents=True)
+        self.config = self.folder / ".devcontainer" / "devcontainer.json"
+        self.config.write_text("{}")
+        self.dev = {
+            "Id": "dev-id", "Name": "/dev-work", "Created": "2026-10-30",
+            "State": {"Status": "running", "Running": True},
+            "Config": {"Labels": {"devcontainer.local_folder": str(self.folder),
+                                  "devcontainer.config_file": str(self.config),
+                                  "devcontainer.metadata": '[{"remoteUser":"vscode"}]'},
+                       "WorkingDir": "/fallback", "Image": "dev:latest"},
+            "Mounts": [{"Source": str(self.folder), "Destination": "/workspaces/project"}],
+        }
+        env = patch.dict(os.environ, {"HC_DEVCONTAINER_CLI": "devcontainer",
+                                      "XDG_STATE_HOME": str(self.temp / "state")})
+        env.start()
+        self.addCleanup(env.stop)
+        which = patch.object(helper.shutil, "which", side_effect=lambda name: f"/bin/{name}")
+        which.start()
+        self.addCleanup(which.stop)
+        self.target = ["--workspace-folder", str(self.folder), "--config", str(self.config),
+                       "--id-label", f"devcontainer.local_folder={self.folder}",
+                       "--id-label", f"devcontainer.config_file={self.config}"]
+
+    def connect(self, argv, up_code=0, container=None):
+        with patch.object(helper, "inspect", return_value=[container or self.dev]), \
+                patch.object(helper, "folder_ids", return_value=["dev-id"]), \
+                patch.object(helper.subprocess, "run", return_value=done(code=up_code)) as run, \
+                patch.object(helper.subprocess, "Popen") as popen, \
+                patch.object(helper.os, "execvp") as execvp, \
+                patch.object(helper.os, "execvpe") as execvpe, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(helper.main(argv), 0)
+        return SimpleNamespace(run=run, popen=popen, execvp=execvp, execvpe=execvpe, errors=errors.getvalue())
+
+    def test_cli_comes_from_the_environment_or_path(self):
+        with patch.object(helper.shutil, "which", side_effect=lambda name: f"/bin/{name}" if name != "missing" else None):
+            for value, expected in (("devcontainer", ["devcontainer"]),
+                                    ("node '/x/my cli.js'", ["node", "/x/my cli.js"]),
+                                    ("", None), ("missing --flag", None)):
+                with self.subTest(value=value), patch.dict(os.environ, {"HC_DEVCONTAINER_CLI": value}):
+                    self.assertEqual(helper.devcontainer_cli(), expected)
+            with patch.dict(os.environ):
+                del os.environ["HC_DEVCONTAINER_CLI"]
+                self.assertEqual(helper.devcontainer_cli(), ["devcontainer"])
+            # cmd would re-parse the connection line through devcontainer.cmd.
+            with patch.object(helper, "WINDOWS", True):
+                self.assertIsNone(helper.devcontainer_cli())
+
+    def test_folder_connect_opens_like_vs_code_then_execs_through_the_cli(self):
+        line = "printf 'hi'; echo \"$1\""
+        with patch.dict(os.environ, {"HC_DEVCONTAINER_DOCKER": "podman"}):
+            got = self.connect([str(self.folder), line])
+        common = ["--docker-path", "podman"]
+        # Blocking hooks (up to waitFor) first, like VS Code before it connects its window ...
+        got.run.assert_called_once_with(
+            ["devcontainer", "up", *common, *self.target, "--expect-existing-container", "--skip-non-blocking-commands"],
+            stdin=helper.subprocess.DEVNULL, stdout=2, check=False)
+        # ... then postCreate/postStart/postAttach in the background, logged.
+        argv, kwargs = got.popen.call_args.args[0], got.popen.call_args.kwargs
+        self.assertEqual(argv, ["devcontainer", "run-user-commands", *common, *self.target])
+        self.assertEqual(kwargs["stdin"], helper.subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["stdout"].name, str(self.temp / "state" / "hc-devcontainer" / "dev-work.log"))
+        # The CLI sets the user, userEnvProbe env, remoteEnv and the workspace folder itself.
+        got.execvp.assert_called_once_with("devcontainer", [
+            "devcontainer", "exec", *common, "--container-id", "dev-id", *self.target,
+            "sh", "-c", helper.WRAPPER, "sh", line])
+        got.execvpe.assert_not_called()
+
+    def test_failed_up_still_connects_by_container_id(self):
+        got = self.connect([str(self.folder), "true"], up_code=1)
+        got.popen.assert_not_called()
+        got.execvp.assert_called_once_with("devcontainer", [
+            "devcontainer", "exec", "--docker-path", "docker", "--container-id", "dev-id",
+            "sh", "-c", helper.WRAPPER, "sh", "true", "/workspaces/project"])
+        self.assertIn("lifecycle commands skipped", got.errors)
+
+    def test_a_cli_that_cannot_run_falls_back_to_docker_exec(self):
+        # e.g. the npm shim's `env node` without node on core's PATH.
+        got = self.connect([str(self.folder), "true"], up_code=127)
+        got.popen.assert_not_called()
+        got.execvp.assert_not_called()
+        self.assertEqual(got.execvpe.call_args.args[1][:2], ["docker", "exec"])
+        self.assertIn("using docker exec", got.errors)
+
+    def test_without_the_config_on_this_host_only_exec_runs(self):
+        self.config.unlink()
+        got = self.connect([str(self.folder), "true"])
+        got.run.assert_not_called()
+        got.popen.assert_not_called()
+        self.assertEqual(got.execvp.call_args.args[1][:6],
+                         ["devcontainer", "exec", "--docker-path", "docker", "--container-id", "dev-id"])
+        self.assertEqual(got.execvp.call_args.args[1][-3:], ["sh", "true", "/workspaces/project"])
+
+    def test_legacy_label_execs_by_container_id_without_lifecycle(self):
+        legacy = copy.deepcopy(self.dev)
+        legacy["Config"]["Labels"] = {"vsch.local.folder": str(self.folder)}
+        got = self.connect([str(self.folder), "true"], container=legacy)
+        got.run.assert_not_called()
+        self.assertNotIn("--workspace-folder", got.execvp.call_args.args[1])
+
+    def test_plain_container_execs_through_the_cli(self):
+        plain = {"Id": "plain-id", "Name": "/web", "State": {"Status": "running"},
+                 "Config": {"Labels": {}, "WorkingDir": "/app"}}
+        got = self.connect(["--container", "web", "true"], container=plain)
+        got.run.assert_not_called()
+        got.execvp.assert_called_once_with("devcontainer", [
+            "devcontainer", "exec", "--docker-path", "docker", "--container-id", "web",
+            "sh", "-c", helper.WRAPPER, "sh", "true", "/app"])
+
+    def test_start_opens_folder_dev_containers_like_vs_code(self):
+        stopped = copy.deepcopy(self.dev)
+        stopped["State"] = {"Status": "exited", "Running": False}
+        with patch.object(helper, "inspect", return_value=[stopped]), \
+                patch.object(helper.subprocess, "run", return_value=done()) as run:
+            self.assertEqual(helper.main(["start", "dev-id"]), 0)
+        run.assert_called_once_with(
+            ["devcontainer", "up", "--docker-path", "docker", *self.target,
+             "--expect-existing-container", "--skip-non-blocking-commands"],
+            stdin=helper.subprocess.DEVNULL, capture_output=True, text=True, check=False)
+
+    def test_start_falls_back_to_docker_start(self):
+        stopped = copy.deepcopy(self.dev)
+        failed = done(code=1, stdout='{"outcome":"error","message":"bad config"}')
+        with patch.object(helper, "inspect", return_value=[stopped]), \
+                patch.object(helper.subprocess, "run", side_effect=[failed, done()]) as run, \
+                redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(helper.main(["start", "dev-id"]), 0)
+        self.assertEqual(run.call_args.args[0], ["docker", "start", "dev-id"])
+        self.assertIn("bad config", errors.getvalue())
+        stopped["Config"]["Labels"] = {}
+        with patch.object(helper, "inspect", return_value=[stopped]), \
+                patch.object(helper.subprocess, "run", return_value=done()) as run:
+            self.assertEqual(helper.main(["start", "dev-id"]), 0)
+        run.assert_called_once_with(["docker", "start", "dev-id"], capture_output=True, text=True, check=False)
+
+    def test_ls_json_keeps_its_fields(self):
+        with patch.object(helper, "inspect", return_value=[self.dev]), patch.object(helper, "ps", return_value=[]):
+            with redirect_stdout(io.StringIO()) as output:
+                helper.main(["ls", "--all", "--json"])
+        self.assertNotIn("cli_labels", json.loads(output.getvalue())[0])
+
 
 if __name__ == "__main__":
     unittest.main()

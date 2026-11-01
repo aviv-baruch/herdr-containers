@@ -17,6 +17,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 
 - Herdr app 0.1.10 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
+- Recommended: the [Dev Containers CLI](https://github.com/devcontainers/cli) (`devcontainer`, the engine of VS Code's Dev Containers) and Node.js on that same PATH, so dev containers start and connect as they do in VS Code. Install it with `npm install -g @devcontainers/cli`, or VS Code's **Dev Containers: Install devcontainer CLI** command. Without it, the helper uses plain `docker exec`. See [VS Code parity](#vs-code-parity).
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
 - On Windows: Python 3 (the `py` launcher, or `python`), the two launchers in `requirements/windows/`, and for connecting, Git for Windows' `sh` and a Herdr Core that accepts `--via` there. See [Windows](#windows).
 - Optional: the [Herdr Core Feature](requirements/feature/herdr-core/README.md) to preserve core state across dev container rebuilds.
@@ -153,7 +154,7 @@ Click a group header to collapse its rows while retaining the count. Click the C
 
 | Case | Behavior |
 | --- | --- |
-| Stop/start | Stopped dev containers stay listed; **Start** runs `docker start`. A stopped plain container with a machine stays listed too. The machine reconnects in about 2–4 s with the same core id. Agents running in the container die when it stops. |
+| Stop/start | Stopped dev containers stay listed; **Start** runs `devcontainer up` (or `docker start` without the CLI). A stopped plain container with a machine stays listed too. The machine reconnects in about 2–4 s with the same core id. Agents running in the container die when it stops. |
 | Docker daemon restart | Dev containers stay stopped without a restart policy; use **Start**. The machine reconnects in about 2–4 s with the same id. |
 | Rebuild with Feature | The preserved state volume keeps the same core id; Herdr reconnects automatically. |
 | Rebuild without Feature | Use **Repair** on the unreachable machine row. It adds the container under a spare name first, then removes the old machine and renames the new one, so a failed add leaves the old machine untouched. It opens a new space if needed. |
@@ -164,7 +165,22 @@ Click a group header to collapse its rows while retaining the count. Click the C
 | Host core restart | Machines reconnect. |
 | Duplicate folder | The newest running container wins; the connector warns on stderr. |
 
-The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell) and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
+The space folder follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell).
+
+### VS Code parity
+
+With the Dev Containers CLI on the PATH of app and core, `hc-devcontainer` drives dev containers through the same engine VS Code's Dev Containers extension uses, so a container behaves as it does when you open it in VS Code and use its terminal:
+
+| VS Code does | Here |
+| --- | --- |
+| Opens the folder in its existing container, starting it if stopped | **Start** and every connection run `devcontainer up --expect-existing-container --skip-non-blocking-commands` with the container's own `devcontainer.local_folder` and `devcontainer.config_file` labels. It never builds or replaces a container. |
+| Waits for `onCreateCommand` and `updateContentCommand` (up to `waitFor`) | The same `up` runs them, once per container, before the connection opens. |
+| Runs `postCreateCommand`, `postStartCommand` and `postAttachCommand` in the background | `devcontainer run-user-commands` runs them in the background while the connection opens; output goes to `${XDG_STATE_HOME:-~/.local/state}/hc-devcontainer/<container>.log`. Every connection is an attach, so `postAttachCommand` runs whenever core connects or reconnects. |
+| Terminals run as `remoteUser`, with `userEnvProbe` (a login interactive shell by default, so `.bashrc`, `.profile`, nvm and similar apply), `remoteEnv` with all its variables, in the workspace folder | The connection runs through `devcontainer exec` with the container id and its `devcontainer.json`, so herdr-core and every terminal and agent it starts inherit exactly that. |
+
+`devcontainer.json` is read from the host on each connection, as VS Code reads it on each open, so `remoteEnv` edits apply on the next reconnect without a rebuild. If that file is gone from this host, or `up` fails, the helper still connects with `devcontainer exec --container-id`, using the metadata baked into the container; a warning goes to stderr. Plain containers connect with `devcontainer exec --container-id` too, like VS Code's **Attach to Running Container**, without lifecycle commands.
+
+Without the CLI, or when it cannot run (for example `node` missing from core's PATH), the helper falls back to `docker exec`: no lifecycle commands or `userEnvProbe`, but `remoteEnv` is applied (values pass through the environment, never the command line). `HC_DEVCONTAINER_CLI` picks the CLI, for example `HC_DEVCONTAINER_CLI="node /path/to/devContainersSpecCLI.js"`; set it empty to always use `docker exec`. On Windows the helper always uses `docker exec`, since the CLI's `devcontainer.cmd` shim would make `cmd` re-parse the connection line. With the CLI, `remoteEnv` values appear on the `docker exec` command line it runs, as they do with VS Code's.
 
 ## For agents
 

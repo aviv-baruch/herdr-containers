@@ -9,7 +9,8 @@ A Herdr mod package, `herdr-containers/`: `mods/containers` (the panel, always i
 four recommended swaps `mods/{spaces,agents,settings,workspace-chrome}-containers` (patched
 copies of Herdr's shipped mods), `keys.json`, `RECIPE.md`. No `layouts/` folder: the panel
 goes into the layout the person already uses. Requirements: `hc-devcontainer` on the PATH of
-both app and core, Docker or podman, herdr-core. Optional: the `herdr-core` dev container
+both app and core, Docker or podman, herdr-core. Recommended: the Dev Containers CLI
+(`devcontainer`, plus Node.js) on both PATHs, so containers start and connect as in VS Code. Optional: the `herdr-core` dev container
 Feature, so rebuilt containers keep their identity.
 
 ## Install
@@ -97,6 +98,7 @@ mods other people made"). The app home is
 | "This Herdr Core refuses --via machines on Windows" | Released core refuses them on Windows. Use a core that accepts `--via`, or run Herdr inside WSL. |
 | "cannot reach … cannot run it" on Windows | Core can't find `sh`. Put Git for Windows' `C:\Program Files\Git\bin` on core's PATH, then restart core. |
 | "hc is not installed" right after adding | Core can't find `hc-devcontainer` (sh exits 127). Put it on core's PATH, restart core. |
+| Hooks don't run, tools from `.bashrc`/nvm missing in terminals | No Dev Containers CLI on core's PATH, so the helper fell back to `docker exec`. Install `@devcontainers/cli` and Node.js where core sees them, restart core. Hook output: `~/.local/state/hc-devcontainer/<container>.log`. |
 | "Docker isn't running" | Start Docker. Dev containers stay stopped: use **Start** on the row. |
 | Dev container listed under Other containers | It has no folder label (`devcontainer.local_folder` or `vsch.local.folder`) and isn't a `vsc-*` image with devcontainer metadata. Start it with VS Code or `devcontainer up`. |
 | Row shows **Repair** | Rebuilt without the Feature (new core id). Click Repair; add the Feature to avoid it. |

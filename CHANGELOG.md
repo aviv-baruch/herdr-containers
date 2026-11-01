@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Dev containers start and connect through the Dev Containers CLI, VS Code's
+  own engine, when `devcontainer` is on PATH: lifecycle commands
+  (`onCreateCommand` through `postAttachCommand`), `userEnvProbe`, full
+  `remoteEnv` substitution, `remoteUser` and the workspace folder now behave
+  as in VS Code. Plain containers connect with `devcontainer exec` too.
+  Without the CLI, and on Windows, the helper keeps using `docker exec`.
 - Clones rebuilt for Herdr 0.1.10.
 - Published as a herdr.dev mod with topic `herdr-mod`; removed the
   `main-containers` layout.

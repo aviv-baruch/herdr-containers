@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""List Docker containers and run a herdr-core connection line in one."""
+"""List Docker containers and run a herdr-core connection line in one.
+
+With the Dev Containers CLI (the engine of VS Code's Dev Containers) on PATH, starting and
+connecting go through it, so hooks, userEnvProbe and remoteEnv apply as in VS Code.
+"""
 
 import argparse
 import json
@@ -103,10 +107,8 @@ def machine_name(folder):
     return name
 
 
-def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
-    # Core starts terminals in its own folder when Herdr names none; the image's
-    # WORKDIR is often empty (/), so start in the workspace when it exists.
-    script = """if [ -z "${SHELL:-}" ]; then
+# Sets SHELL from passwd when missing, starts in $2 if given, then runs the connection line $1.
+WRAPPER = """if [ -z "${SHELL:-}" ]; then
     unset SHELL
     user=$(id -un)
     if command -v getent >/dev/null 2>&1; then
@@ -120,10 +122,93 @@ fi
 [ "$#" -lt 2 ] || cd -- "$2" >/dev/null 2>&1 || :
 exec sh -c "$1"
 """
+
+
+def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
+    # Core starts terminals in its own folder when Herdr names none; the image's
+    # WORKDIR is often empty (/), so start in the workspace when it exists.
     return [docker, "exec", "-i", *(["-u", user] if user else []),
             *(part for name in (remote_env or {}) if isinstance(name, str) and ENV_NAME.fullmatch(name)
               for part in ("-e", name)),
-            container_id, "sh", "-c", script, "sh", line, *([workspace] if workspace else [])]
+            container_id, "sh", "-c", WRAPPER, "sh", line, *([workspace] if workspace else [])]
+
+
+def devcontainer_cli():
+    """The Dev Containers CLI (VS Code's dev container engine) as argv, or None for plain docker."""
+    if WINDOWS:
+        # Its npm shim is devcontainer.cmd, and cmd would re-parse the connection line.
+        return None
+    configured = os.environ.get("HC_DEVCONTAINER_CLI")
+    parts = shlex.split(configured) if configured is not None else ["devcontainer"]
+    return parts if parts and shutil.which(parts[0]) else None
+
+
+def cli_target(row):
+    """Options that let the CLI read this container's devcontainer.json, if this host still has it."""
+    labels = row.get("cli_labels") or {}
+    folder, config = labels.get("devcontainer.local_folder"), labels.get("devcontainer.config_file")
+    if not folder or not os.path.isdir(folder) or (config and not os.path.isfile(config)):
+        return []
+    # Exact id labels: the CLI must find this container, never build a new one.
+    return ["--workspace-folder", folder, *(["--config", config] if config else []),
+            *(part for name, value in labels.items() for part in ("--id-label", f"{name}={value}"))]
+
+
+def up_argv(cli, docker, target):
+    # Starts the container if needed and runs hooks up to waitFor, as VS Code does before it connects.
+    return [*cli, "up", "--docker-path", docker, *target, "--expect-existing-container",
+            "--skip-non-blocking-commands"]
+
+
+def log_file(row):
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    folder = os.path.join(state, "hc-devcontainer")
+    os.makedirs(folder, exist_ok=True)
+    return open(os.path.join(folder, f"{row['name']}.log"), "ab")
+
+
+def connect(docker, row, container_id, line):
+    """Attach the way VS Code does: lifecycle hooks, then exec with its user, env and folder."""
+    cli = devcontainer_cli()
+    target = cli_target(row) if cli else []
+    if target:
+        # stdout carries the connection; the CLI's output goes to stderr, and stdin stays core's.
+        up = subprocess.run(up_argv(cli, docker, target), stdin=subprocess.DEVNULL, stdout=2, check=False)
+        if up.returncode == 127:
+            print("hc-devcontainer: the devcontainer CLI cannot run; using docker exec", file=sys.stderr)
+            cli = None
+        elif up.returncode:
+            print("hc-devcontainer: devcontainer up failed; lifecycle commands skipped", file=sys.stderr)
+            target = []
+        else:
+            # postCreate, postStart and postAttach run on while the connection is up, like VS Code's.
+            with log_file(row) as log:
+                subprocess.Popen([*cli, "run-user-commands", "--docker-path", docker, *target],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    if not cli:
+        return exec_container(docker, row, container_id, line)
+    # The CLI sets remoteUser, userEnvProbe and remoteEnv, and with the config, the workspace folder.
+    workspace = [] if target or not row.get("workspace") else [row["workspace"]]
+    argv = [*cli, "exec", "--docker-path", docker, "--container-id", container_id, *target,
+            "sh", "-c", WRAPPER, "sh", line, *workspace]
+    os.execvp(argv[0], argv)
+
+
+def start(docker, container_id):
+    cli = devcontainer_cli()
+    found = rows(inspect(docker, [container_id])) if cli else []
+    target = cli_target(found[0]) if found else []
+    if target:
+        result = subprocess.run(up_argv(cli, docker, target), stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, check=False)
+        if not result.returncode:
+            return
+        try:
+            message = json.loads(result.stdout.strip().splitlines()[-1])["message"]
+        except (IndexError, KeyError, TypeError, ValueError):
+            message = result.stderr.strip() or f"exit {result.returncode}"
+        print(f"hc-devcontainer: devcontainer up failed ({message}); using docker start", file=sys.stderr)
+    run([docker, "start", container_id])
 
 
 def exec_container(docker, row, container_id, line):
@@ -238,6 +323,10 @@ def rows(containers):
             "suggested_name": machine_name(folder if folder else name),
             "created": item.get("Created", ""),
         }
+        cli_labels = {key: labels[key] for key in ("devcontainer.local_folder", "devcontainer.config_file")
+                      if labels.get(key)}
+        if cli_labels:
+            row["cli_labels"] = cli_labels
         remote_env = metadata_remote_env(raw, config.get("Env"))
         if remote_env:
             row["remote_env"] = remote_env
@@ -293,6 +382,7 @@ def main(argv=None):
             for row in found:
                 row.pop("created")
                 row.pop("remote_env", None)
+                row.pop("cli_labels", None)
             print(json.dumps(found))
         else:
             for row in found:
@@ -303,7 +393,7 @@ def main(argv=None):
         parser = argparse.ArgumentParser(prog="hc-devcontainer start")
         parser.add_argument("id")
         args = parser.parse_args(argv[1:])
-        run([docker, "start", args.id])
+        start(docker, args.id)
         return 0
 
     if argv and argv[0] == "exists":
@@ -327,7 +417,7 @@ def main(argv=None):
         found = [row for row in rows(inspect(docker, [args.container])) if row["state"] == "running"]
         if not found:
             raise RuntimeError(f"container {args.container!r} is not running")
-        return exec_container(docker, found[0], found[0]["name"], args.args[0]) or 0
+        return connect(docker, found[0], found[0]["name"], args.args[0]) or 0
     if len(args.args) != 2:
         parser.error("expected <folder> <line>, or --container NAME <line>")
     folder, line = args.args
@@ -339,7 +429,7 @@ def main(argv=None):
     found.sort(key=lambda row: row["created"], reverse=True)
     if len(found) > 1:
         print(f"hc-devcontainer: {len(found)} containers match; using newest {found[0]['id']}", file=sys.stderr)
-    return exec_container(docker, found[0], found[0]["id"], line) or 0
+    return connect(docker, found[0], found[0]["id"], line) or 0
 
 
 if __name__ == "__main__":

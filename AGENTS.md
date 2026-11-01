@@ -38,6 +38,12 @@ only hand-written mod; its tests are in `test/test_containers.cjs`.
   --install`) and core runs it for every connection, so both PATHs need it. If
   core's PATH lacks it, the shell exits 127 and `hc machine add` can say “hc is
   not installed.” Restart core after a PATH change.
+- With the `devcontainer` CLI on core's PATH, every connection runs `up`
+  (hooks to `waitFor`), background `run-user-commands`, then `devcontainer
+  exec`; without it, or when it exits 127 (no `node`), the helper uses
+  `docker exec`. `up` always gets `--expect-existing-container` and exact id
+  labels: it must never build. Its stdout is the connection; send CLI output
+  to stderr and keep stdin for core. Tests pin `HC_DEVCONTAINER_CLI=""`.
 - Shipped Spaces caches machines for 15 s; the app polls `machine.list`
   about every 2.5 s. `space.close` only queues closure.
 - Tests and smokes use isolated `HC_SESSION` and scratch `HERDR_APP_HOME`.
