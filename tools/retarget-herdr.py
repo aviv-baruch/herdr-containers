@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update docs and CI after rebuilding the Herdr clone mods."""
+"""Update docs and the CI pin after rebuilding the Herdr clone mods."""
 
 import argparse
 import json
@@ -12,7 +12,6 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CLONES = ("spaces", "agents", "settings", "workspace-chrome")
-REF = re.compile(r"^([ \t]*ref: )([0-9a-fA-F]{40})( # v)(\d+\.\d+\.\d+)([ \t]*)$", re.M)
 
 
 def staged_file(target, content, mode):
@@ -72,17 +71,15 @@ def retarget(root, version, sha):
         if found != version:
             raise ValueError(f"{name}-containers: cloned_from.version is {found}, expected {version}")
 
-    ci_path = root / ".github/workflows/check.yml"
-    ci = ci_path.read_text(encoding="utf-8")
-    matches = list(REF.finditer(ci))
-    if len(matches) != 1:
-        raise ValueError("check.yml: expected exactly one herdr-app ref: SHA # vX.Y.Z line")
-    match = matches[0]
-    # The builder already replaced the clones' old version.
-    old_version = match.group(4)
-    ci = ci[:match.start()] + f"{match.group(1)}{sha}{match.group(3)}{version}{match.group(5)}" + ci[match.end():]
+    # CI reads this pin; GITHUB_TOKEN may not push edits under .github/workflows.
+    pin_path = root / ".github/herdr-app.json"
+    pin = json.loads(pin_path.read_text(encoding="utf-8"))
+    old_version = pin.get("version")
+    if not isinstance(old_version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", old_version):
+        raise ValueError("herdr-app.json: expected a version X.Y.Z")
+    pin.update(version=version, sha=sha)
 
-    changes = {ci_path: ci}
+    changes = {pin_path: json.dumps(pin, indent=2) + "\n"}
     mention = re.compile(r"(\b(?:Herdr(?: app)?|herdr-app) v?)" + re.escape(old_version) + r"\b")
     for relative in ("README.md", "herdr-containers/RECIPE.md"):
         path = root / relative

@@ -131,7 +131,7 @@ jobs:
           set -eu
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A .github/workflows/check.yml README.md herdr-containers/RECIPE.md \
+          git add -A .github/herdr-app.json README.md herdr-containers/RECIPE.md \
             herdr-containers/mods CHANGELOG.md
           git commit -m "build: rebuild clones for herdr $VERSION"
           git push origin "HEAD:refs/heads/$BRANCH"
