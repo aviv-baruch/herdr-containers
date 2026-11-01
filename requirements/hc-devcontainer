@@ -124,8 +124,62 @@ pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
 for url do printf '%s\\n' "$url" >>"$dir/open"; done
 """
 
+# Git's credential helper in the container, like VS Code's: each request goes to
+# the host's `git credential` through `serve`. Without a live listener it stays
+# silent, so git carries on as if it weren't configured.
+CREDENTIAL_HELPER = """#!/bin/sh
+dir=$(dirname -- "$0")
+case "${1:-}" in get|store|erase) ;; *) exit 0 ;; esac
+pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
+    tr '\\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q hc-devcontainer-serve || exit 0
+umask 077
+id=$$-$(date +%s)
+{ echo "$1"; cat; } >"$dir/cred/$id.tmp" 2>/dev/null && mv -f "$dir/cred/$id.tmp" "$dir/cred/$id.req" || {
+    rm -f "$dir/cred/$id.tmp"
+    exit 0
+}
+[ "$1" = get ] || exit 0
+# The host may show its own sign-in; give it time.
+end=$(($(date +%s) + 120))
+while [ ! -e "$dir/cred/$id.res" ]; do
+    [ "$(date +%s)" -lt "$end" ] || { rm -f "$dir/cred/$id.req"; exit 0; }
+    sleep 0.2 2>/dev/null || sleep 1
+done
+cat "$dir/cred/$id.res"
+rm -f "$dir/cred/$id.res"
+"""
+
+# git runs a "!" helper through sh with the operation appended.
+GIT_CREDENTIAL = '!f() { h="$HOME/.cache/herdr-containers/git-credential"; [ ! -x "$h" ] || "$h" "$@"; }; f'
+
+# Adds the helper ($2) to git config at scope $1, once.
+CREDENTIAL_CONFIG = """command -v git >/dev/null 2>&1 || exit 0
+git config "--$1" --get-all credential.helper 2>/dev/null | grep -qxF -- "$2" ||
+    git config "--$1" --add credential.helper "$2"
+"""
+
+# Installs the helper from stdin for this user, then configures it if $1 names a scope.
+CREDENTIAL_SETUP = """umask 077
+dir="$HOME/.cache/herdr-containers"
+mkdir -p "$dir" && chmod 700 "$dir" || exit 1
+if ! { cat >"$dir/git-credential.$$" && chmod 755 "$dir/git-credential.$$" &&
+        mv -f "$dir/git-credential.$$" "$dir/git-credential"; }; then
+    rm -f "$dir/git-credential.$$"
+    exit 1
+fi
+[ -n "$1" ] || exit 0
+""" + CREDENTIAL_CONFIG
+
+# The host's answer to request $1, from stdin.
+CREDENTIAL_ANSWER = """umask 077
+cred="$HOME/.cache/herdr-containers/cred"
+[ -d "$cred" ] || exit 0
+cat >"$cred/$1.tmp" && mv -f "$cred/$1.tmp" "$cred/$1.res"
+"""
+
 # One listener per container user (hc-devcontainer-serve marks its cmdline).
-# Prints "open URL" and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
+# Prints "open URL", "cred ID HEX" (a credential request, hex because it spans
+# lines) and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
 # Exit 3: another runs; 4: no home to work in.
 LISTEN = """# hc-devcontainer-serve
 umask 077
@@ -145,18 +199,28 @@ exec 3<&0
 (cat <&3 >/dev/null; kill $$) &
 exec 3<&-
 rm -f "$dir/open"
+rm -rf "$dir/cred"
+mkdir "$dir/cred" || exit 4
 last=
 while :; do
     if [ -s "$dir/open" ] && mv -f "$dir/open" "$dir/open.$$" 2>/dev/null; then
         sed 's/^/open /' "$dir/open.$$" || exit 0
         rm -f "$dir/open.$$"
     fi
+    for req in "$dir"/cred/*.req; do
+        [ -f "$req" ] || continue
+        id=${req##*/}
+        id=${id%.req}
+        mv -f "$req" "$dir/cred/$id.work" 2>/dev/null || continue
+        echo "cred $id $(od -An -v -tx1 <"$dir/cred/$id.work" | tr -d ' \\n')" || exit 0
+        rm -f "$dir/cred/$id.work"
+    done
     ports=$(awk '$4 == "0A" { print $2 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr '\\n' ' ')
     if [ "$ports" != "$last" ]; then
         echo "ports $ports" || exit 0
         last=$ports
     fi
-    sleep 1
+    sleep 0.5 2>/dev/null || sleep 1
 done
 """
 
@@ -227,8 +291,14 @@ def host_opener():
     return ["xdg-open"]
 
 
+# Keys of git's credential protocol (key=value, a [] suffix for lists).
+CREDENTIAL_KEY = re.compile(r"[a-z_]+(?:\[\])?\Z")
+CREDENTIAL_ACTION = {"get": "fill", "store": "approve", "erase": "reject"}
+
+
 class Server:
-    """Opens the container's links here and forwards its listening ports."""
+    """Opens the container's links here, forwards its listening ports, and answers
+    its git credential requests from the host's git."""
 
     def __init__(self, docker, container, user):
         self.docker, self.container, self.user = docker, container, user
@@ -238,9 +308,53 @@ class Server:
         self.proc = None
         self.stopped = False
 
-    def exec_argv(self, script, *args):
-        return [self.docker, "exec", "-i", *(["-u", self.user] if self.user else []),
+    def exec_argv(self, script, *args, user=None):
+        user = user or self.user
+        return [self.docker, "exec", "-i", *(["-u", user] if user else []),
                 self.container, "sh", "-c", script, "sh", *args]
+
+    def setup_credentials(self):
+        """VS Code's git credential helper, configured where its setting says (global by default)."""
+        where = vscode_settings().get("dev.containers.gitCredentialHelperConfigLocation", "global")
+        if where not in ("global", "system"):
+            return
+        try:
+            installed = subprocess.run(self.exec_argv(CREDENTIAL_SETUP, "global" if where == "global" else "",
+                                                      GIT_CREDENTIAL),
+                                       input=CREDENTIAL_HELPER.encode(), capture_output=True, check=False)
+            if not installed.returncode and where == "system":
+                subprocess.run(self.exec_argv(CREDENTIAL_CONFIG, "system", GIT_CREDENTIAL, user="root"),
+                               stdin=subprocess.DEVNULL, capture_output=True, check=False)
+        except OSError:
+            pass
+
+    def credential(self, request_id, encoded):
+        """Answers one request with the host's `git credential`, as VS Code's helper does."""
+        try:
+            op, _, body = bytes.fromhex(encoded).decode().partition("\n")
+        except ValueError:
+            return
+        action = CREDENTIAL_ACTION.get(op.strip())
+        if not action or not re.fullmatch(r"[0-9]+-[0-9]+", request_id):
+            return
+        lines = [line for line in body.splitlines()
+                 if "\0" not in line and CREDENTIAL_KEY.match(line.partition("=")[0]) and "=" in line]
+        answer = b""
+        if lines and shutil.which("git"):
+            try:
+                # No terminal here; the host's helpers (keychain, GCM, askpass) may still ask.
+                found = subprocess.run(["git", "credential", action], input=("\n".join(lines) + "\n\n").encode(),
+                                       capture_output=True, timeout=110, check=False,
+                                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                answer = found.stdout if action == "fill" and not found.returncode else b""
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if op.strip() == "get":
+            try:
+                subprocess.run(self.exec_argv(CREDENTIAL_ANSWER, request_id), input=answer,
+                               capture_output=True, check=False)
+            except OSError:
+                pass
 
     def relay(self, client, port):
         target = self.targets.get(port, "127.0.0.1")
@@ -353,6 +467,10 @@ class Server:
             kind, _, rest = line.rstrip("\n").partition(" ")
             if kind == "open":
                 self.open(rest)
+            elif kind == "cred":
+                # A host sign-in can take a while; links and ports go on meanwhile.
+                request_id, _, encoded = rest.partition(" ")
+                threading.Thread(target=self.credential, args=(request_id, encoded), daemon=True).start()
             elif kind == "ports":
                 self.ports(rest)
         proc.stdout.close()
@@ -360,6 +478,7 @@ class Server:
 
     def run(self):
         """Keeps one listener running until stop(), or until there is no home."""
+        self.setup_credentials()
         while self.listen_once() != 4:
             self.ports("")
             time.sleep(2)

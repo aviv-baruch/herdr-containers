@@ -1230,7 +1230,8 @@ class BrowserTests(unittest.TestCase):
         server = helper.Server("docker", "abc", None)
         listener = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     text=True)
-        with patch.object(helper.subprocess, "Popen", return_value=listener) as popen:
+        with patch.object(helper.subprocess, "Popen", return_value=listener) as popen, \
+                patch.object(server, "setup_credentials"):
             thread = threading.Thread(target=server.run, daemon=True)
             thread.start()
             for _ in range(50):
@@ -1248,6 +1249,197 @@ class BrowserTests(unittest.TestCase):
         with patch.object(helper, "serve_in_background") as serve, patch.object(helper.os, "execvpe"):
             helper.exec_container("docker", row, "abc", "true")
         serve.assert_called_once_with("docker", "abc", "vscode")
+
+
+def fake_listener(home):
+    """A live `serve` listener as the container helpers see it: its pid, marked, in the lock."""
+    proc = subprocess.Popen(["/bin/sh", "-c", "# hc-devcontainer-serve\nsleep 30"])
+    folder = Path(home) / ".cache" / "herdr-containers"
+    (folder / "serve.lock").mkdir(parents=True)
+    (folder / "cred").mkdir()
+    (folder / "serve.lock" / "pid").write_text(f"{proc.pid}\n")
+    return proc, folder
+
+
+class CredentialTests(unittest.TestCase):
+    """The git credential bridge: container git asks the host's git, as with VS Code."""
+
+    def helper_file(self, folder):
+        path = folder / "git-credential"
+        path.write_text(helper.CREDENTIAL_HELPER)
+        path.chmod(0o755)
+        return path
+
+    def test_helper_is_silent_without_a_listener(self):
+        with tempfile.TemporaryDirectory() as home:
+            folder = Path(home) / ".cache" / "herdr-containers"
+            folder.mkdir(parents=True)
+            started = time.monotonic()
+            result = subprocess.run([str(self.helper_file(folder)), "get"], input=b"protocol=https\nhost=a.test\n",
+                                    capture_output=True, timeout=5, check=False)
+            self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual((result.returncode, result.stdout), (0, b""))
+
+    def test_helper_asks_the_host_and_prints_its_answer(self):
+        with tempfile.TemporaryDirectory() as home:
+            listener, folder = fake_listener(home)
+            try:
+                helper_path = self.helper_file(folder)
+                answered = []
+
+                def host():  # what serve does with a request
+                    for _ in range(100):
+                        found = list((folder / "cred").glob("*.req"))
+                        if found:
+                            request = found[0]
+                            answered.append(request.read_bytes())
+                            request.unlink()
+                            run_script(helper.CREDENTIAL_ANSWER, request.stem, env={**os.environ, "HOME": home},
+                                       input="username=me\npassword=tok\n")
+                            return
+                        time.sleep(0.05)
+
+                thread = threading.Thread(target=host)
+                thread.start()
+                got = subprocess.run([str(helper_path), "get"], input=b"protocol=https\nhost=a.test\n",
+                                     capture_output=True, timeout=10, check=False)
+                thread.join(5)
+                self.assertEqual(got.stdout, b"username=me\npassword=tok\n")
+                self.assertEqual(answered, [b"get\nprotocol=https\nhost=a.test\n"])
+                self.assertEqual(list((folder / "cred").iterdir()), [])
+                # store and erase hand the request over and return at once.
+                started = time.monotonic()
+                stored = subprocess.run([str(helper_path), "store"], input=b"protocol=https\nhost=a.test\n",
+                                        capture_output=True, timeout=5, check=False)
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(stored.returncode, 0)
+                request = next((folder / "cred").glob("*.req"))
+                self.assertEqual(request.read_bytes(), b"store\nprotocol=https\nhost=a.test\n")
+                self.assertEqual(request.stat().st_mode & 0o077, 0)
+                # Anything but git's three operations is ignored.
+                self.assertEqual(subprocess.run([str(helper_path), "list"], input=b"", check=False).returncode, 0)
+                self.assertEqual(len(list((folder / "cred").glob("*.req"))), 1)
+            finally:
+                listener.kill()
+                listener.wait()
+
+    def test_listener_hands_over_requests_and_drops_stale_ones(self):
+        with tempfile.TemporaryDirectory() as home:
+            folder = Path(home) / ".cache" / "herdr-containers"
+            (folder / "cred").mkdir(parents=True)
+            (folder / "cred" / "1-1.req").write_text("get\nstale\n")
+            proc = subprocess.Popen(["/bin/sh", "-c", helper.LISTEN], env={**os.environ, "HOME": home},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(proc.stdout.readline().startswith("ports "))
+                self.assertEqual(list((folder / "cred").iterdir()), [])
+                (folder / "cred" / "12-34.req").write_bytes(b"get\nprotocol=https\nhost=a.test\n")
+                line = proc.stdout.readline()
+                kind, request_id, encoded = line.rstrip("\n").split(" ")
+                self.assertEqual((kind, request_id), ("cred", "12-34"))
+                self.assertEqual(bytes.fromhex(encoded), b"get\nprotocol=https\nhost=a.test\n")
+                for _ in range(40):  # it removes the request right after printing it
+                    if not list((folder / "cred").iterdir()):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(list((folder / "cred").iterdir()), [])
+            finally:
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+                proc.stdin.close()
+
+    def test_server_answers_get_with_the_hosts_git_and_forwards_store_and_erase(self):
+        server = helper.Server("docker", "abc", "vscode")
+        request = b"get\nprotocol=https\nhost=a.test\nBAD KEY=x\nnot a pair\nwwwauth[]=Basic\n"
+        with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
+                patch.object(helper.subprocess, "run", return_value=done(b"username=me\npassword=tok\n")) as run:
+            server.credential("12-34", request.hex())
+        fill, answer = run.call_args_list
+        self.assertEqual(fill.args[0], ["git", "credential", "fill"])
+        self.assertEqual(fill.kwargs["input"], b"protocol=https\nhost=a.test\nwwwauth[]=Basic\n\n")
+        self.assertEqual(fill.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(answer.args[0], server.exec_argv(helper.CREDENTIAL_ANSWER, "12-34"))
+        self.assertEqual(answer.kwargs["input"], b"username=me\npassword=tok\n")
+        # A failed fill still answers, empty, so the container's git moves on.
+        with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
+                patch.object(helper.subprocess, "run", return_value=done(code=128)) as run:
+            server.credential("12-34", request.hex())
+        self.assertEqual(run.call_args.kwargs["input"], b"")
+        for op, action in (("store", "approve"), ("erase", "reject")):
+            with patch.object(helper.shutil, "which", return_value="/usr/bin/git"), \
+                    patch.object(helper.subprocess, "run", return_value=done()) as run:
+                server.credential("12-34", f"{op}\nprotocol=https\nhost=a.test\nusername=me\npassword=tok\n".encode().hex())
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], ["git", "credential", action])
+        for request_id, encoded in (("12-34", b"list\nhost=a\n".hex()), ("../x", b"get\nhost=a\n".hex()),
+                                    ("12-34", "not hex")):
+            with patch.object(helper.subprocess, "run") as run:
+                server.credential(request_id, encoded)
+            run.assert_not_called()
+
+    def test_setup_follows_vs_codes_setting(self):
+        server = helper.Server("docker", "abc", "vscode")
+        for where, expected in ((None, [("global", "vscode")]), ("global", [("global", "vscode")]),
+                                ("system", [("", "vscode"), ("system", "root")]), ("none", [])):
+            settings = {} if where is None else {"dev.containers.gitCredentialHelperConfigLocation": where}
+            with self.subTest(where=where), patch.object(helper, "vscode_settings", return_value=settings), \
+                    patch.object(helper.subprocess, "run", return_value=done()) as run:
+                server.setup_credentials()
+            got = [(call.args[0][-2], call.args[0][4]) for call in run.call_args_list]
+            self.assertEqual(got, expected)
+            if expected:
+                self.assertEqual(run.call_args_list[0].kwargs["input"], helper.CREDENTIAL_HELPER.encode())
+
+    def test_setup_installs_a_private_helper_and_configures_git_once(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home, "GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(["git", "config", "--global", "--add", "credential.helper", "cache"], env=env, check=True)
+            for _ in range(2):
+                result = run_script(helper.CREDENTIAL_SETUP, "global", helper.GIT_CREDENTIAL, env=env,
+                                    input=helper.CREDENTIAL_HELPER)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            folder = Path(home) / ".cache" / "herdr-containers"
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((folder / "git-credential").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((folder / "git-credential").read_text(), helper.CREDENTIAL_HELPER)
+            helpers = subprocess.run(["git", "config", "--global", "--get-all", "credential.helper"], env=env,
+                                     capture_output=True, text=True, check=True).stdout.splitlines()
+            self.assertEqual(helpers, ["cache", helper.GIT_CREDENTIAL])
+
+    def test_container_git_gets_the_hosts_credentials_end_to_end(self):
+        # Real git on both sides; a fake docker runs the "container" here with its own HOME.
+        with tempfile.TemporaryDirectory() as temp:
+            host_home, container_home = Path(temp) / "host", Path(temp) / "container"
+            host_home.mkdir()
+            container_home.mkdir()
+            (host_home / ".git-credentials").write_text("https://me:tok@example.test\n")
+            git_env = {"GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(["git", "config", "--global", "credential.helper", "store"],
+                           env={**os.environ, **git_env, "HOME": str(host_home)}, check=True)
+            docker = Path(temp) / "docker"
+            docker.write_text('#!/bin/sh\nshift\nwhile :; do case "$1" in -i) shift ;; -u) shift 2 ;; *) break ;; esac; done\n'
+                              f'shift\nHOME={shlex.quote(str(container_home))} exec "$@"\n')
+            docker.chmod(0o755)
+            server = helper.Server(str(docker), "abc", None)
+            with patch.dict(os.environ, {**git_env, "HOME": str(host_home)}), \
+                    patch.object(helper, "vscode_settings", return_value={}), patch.object(server, "ports"):
+                thread = threading.Thread(target=server.run, daemon=True)
+                thread.start()
+                try:
+                    lock = container_home / ".cache" / "herdr-containers" / "serve.lock" / "pid"
+                    for _ in range(100):
+                        if lock.exists() and (lock.parent.parent / "cred").exists():
+                            break
+                        time.sleep(0.05)
+                    got = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=example.test\n\n",
+                                         env={**os.environ, "HOME": str(container_home), "GIT_TERMINAL_PROMPT": "0"},
+                                         capture_output=True, text=True, timeout=20, check=False)
+                finally:
+                    server.stop()
+                    thread.join(5)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn("username=me\npassword=tok\n", got.stdout)
 
 
 if __name__ == "__main__":

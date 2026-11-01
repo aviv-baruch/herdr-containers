@@ -29,6 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Git in containers uses the host's credentials, like VS Code's credential
+  helper: a `credential.helper` added to the container's git config hands
+  each request to the host's `git credential` through `serve`, so HTTPS
+  `git push` uses your host sign-in and credentials typed in the container
+  are saved on the host. VS Code's
+  `dev.containers.gitCredentialHelperConfigLocation` picks `global`,
+  `system` or `none`.
 - Links from containers open on the host like in VS Code, including from
   WSL: `BROWSER` hands URLs to the host's browser and the container's
   listening ports are forwarded to the same host ports, so `localhost` links
