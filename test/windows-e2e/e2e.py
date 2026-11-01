@@ -18,9 +18,10 @@ import unittest
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 GIT_BIN = Path(r"C:\Program Files\Git\bin")
-FOLDER = r"c:\Users\Me\Bob's Proj & Co"
-VIA = "hc-devcontainer 'c:\\Users\\Me\\Bob'\\''s Proj & Co'"
-WORKSPACE = "/workspaces/Bob's Proj & Co"
+FOLDER = r"c:\Users\Me\Bob's Proj & Co\sub dir"
+VIA = "hc-devcontainer 'c:\\Users\\Me\\Bob'\\''s Proj & Co\\sub dir'"
+# The mount is the project; the label a folder in it. The /workspaces guess would say the root.
+WORKSPACE = "/workspaces/Bob's Proj & Co/sub dir"
 # herdr-core machines.rs pipe(), Unix side, no session: the line core sends through a via.
 CORE_LINE = ("sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x \"$p\" ] || "
              "{ echo \"herdr-core is not installed here\" >&2; exit 127; }; exec \"$p\" connect'")
@@ -35,7 +36,7 @@ def containers(exec_env=None):
              "devcontainer.metadata": json.dumps([{"remoteUser": "me"}])}},
          # Docker Desktop's spelling of the drive, in another case than the label.
          "Mounts": [{"Type": "bind", "Source": "/run/desktop/mnt/host/c/users/me/Bob's Proj & Co",
-                     "Destination": WORKSPACE}],
+                     "Destination": "/workspaces/Bob's Proj & Co"}],
          "ExecEnv": exec_env or {}},
         {"Id": "webid0002", "Name": "/web", "Created": "2026-11-01T00:00:00Z",
          "State": {"Status": "running", "Running": True},
@@ -115,7 +116,7 @@ class AppPath(unittest.TestCase):
         self.assertEqual(rows["oldid0003"]["state"], "exited")
 
     def test_exists_and_start_through_cmd(self):
-        for via, code in ((VIA, 0), ("hc-devcontainer 'C:/USERS/ME/BOB'\\''S PROJ & CO'", 0),
+        for via, code in ((VIA, 0), ("hc-devcontainer 'C:/USERS/ME/BOB'\\''S PROJ & CO/SUB DIR/'", 0),
                           ("hc-devcontainer --container 'web'", 0), ("hc-devcontainer 'c:\\gone'", 1),
                           ("hc-devcontainer --container 'gone'", 1)):
             r = self.box.app("exists", via)
@@ -124,10 +125,16 @@ class AppPath(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.box.calls("start"), [["start", "oldid0003"]])
 
-    def test_missing_helper_is_cmd_exit_9009(self):
+    def test_missing_helper_and_the_where_lookup_the_mod_confirms_it_with(self):
         env = {**self.box.env, "PATH": os.pathsep.join(p for p in self.box.env["PATH"].split(os.pathsep)
                                                        if Path(p) != self.box.bin)}
-        self.assertEqual(self.box.app("ls", "--all", "--json", env=env).returncode, 9009)
+        r = self.box.app("ls", "--all", "--json", env=env)
+        print("cmd without the helper:", r.returncode, repr(r.stdout), repr(r.stderr))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(r.stderr.startswith("hc-devcontainer:"), r.stderr)
+        where = [str(self.box.tools / "app.exe"), "where", "hc-devcontainer.cmd"]
+        self.assertNotEqual(subprocess.run(where, env=env, capture_output=True).returncode, 0)
+        self.assertEqual(subprocess.run(where, env=self.box.env, capture_output=True).returncode, 0)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows only")
