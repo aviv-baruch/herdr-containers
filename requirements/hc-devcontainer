@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""List Docker containers and run a herdr-core connection line in one."""
+"""List Docker containers and run a herdr-core connection line in one.
+
+With the Dev Containers CLI (the engine of VS Code's Dev Containers) on PATH, starting and
+connecting go through it, so hooks, userEnvProbe and remoteEnv apply as in VS Code.
+"""
 
 import argparse
 import json
@@ -14,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 FOLDER_LABELS = ("devcontainer.local_folder", "vsch.local.folder")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -390,10 +395,8 @@ def serve_in_background(docker, container_id, user):
         pass
 
 
-def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
-    # Core starts terminals in its own folder when Herdr names none; the image's
-    # WORKDIR is often empty (/), so start in the workspace when it exists.
-    script = """if [ -z "${SHELL:-}" ]; then
+# Sets SHELL from passwd when missing, starts in $2 if given, then runs the connection line $1.
+WRAPPER = """if [ -z "${SHELL:-}" ]; then
     unset SHELL
     user=$(id -un)
     if command -v getent >/dev/null 2>&1; then
@@ -417,10 +420,355 @@ rm -f "$dir/browser.$$" 2>/dev/null
 unset dir
 exec sh -c "$1"
 """
+
+
+def exec_argv(docker, container_id, user, line, remote_env=None, workspace=""):
+    # Core starts terminals in its own folder when Herdr names none; the image's
+    # WORKDIR is often empty (/), so start in the workspace when it exists.
     return [docker, "exec", "-i", *(["-u", user] if user else []),
             *(part for name in (remote_env or {}) if isinstance(name, str) and ENV_NAME.fullmatch(name)
               for part in ("-e", name)),
-            container_id, "sh", "-c", script, "sh", line, *([workspace] if workspace else [])]
+            container_id, "sh", "-c", WRAPPER, "sh", line, *([workspace] if workspace else [])]
+
+
+def vscode_user():
+    """VS Code's User folder: settings.json, and the extension's record of its engine."""
+    configured = os.environ.get("HC_DEVCONTAINER_VSCODE_USER")
+    if configured:
+        return configured
+    base = (os.path.expanduser("~/Library/Application Support") if sys.platform == "darwin"
+            else os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    return os.path.join(base, "Code", "User")
+
+
+def vscode_engine(bin_dir):
+    """The CLI VS Code's Dev Containers bundles, run by VS Code's Electron as Node, as its own
+    devcontainer command does. The extension rewrites these two files whenever it activates."""
+    try:
+        with open(os.path.join(bin_dir, "vscode-path"), encoding="utf-8") as stream:
+            electron = stream.read().strip()
+        with open(os.path.join(bin_dir, "remote-containers-path"), encoding="utf-8") as stream:
+            extension = stream.read().strip()
+    except (OSError, UnicodeError):
+        return None
+    script = os.path.join(extension, "dist", "spec-node", "devContainersSpecCLI.js")
+    return [electron, script] if os.access(electron, os.X_OK) and os.path.isfile(script) else None
+
+
+def devcontainer_cli():
+    """The Dev Containers CLI as argv, or None for plain docker: HC_DEVCONTAINER_CLI, else VS
+    Code's own engine, else a devcontainer command (@devcontainers/cli) on PATH."""
+    if WINDOWS:
+        # Its npm shim is devcontainer.cmd, and cmd would re-parse the connection line.
+        return None
+    configured = os.environ.get("HC_DEVCONTAINER_CLI")
+    if configured is not None:
+        parts = shlex.split(configured)
+        return parts if parts and shutil.which(parts[0]) else None
+    engine = vscode_engine(os.path.join(vscode_user(), "globalStorage", "ms-vscode-remote.remote-containers", "cli-bin"))
+    found = shutil.which("devcontainer")
+    if not engine and found:
+        # VS Code's installed devcontainer command only opens and builds; the engine is beside it.
+        shim = os.path.dirname(os.path.realpath(found))
+        if not os.path.exists(os.path.join(shim, "vscode-path")):
+            return ["devcontainer"]
+        engine = vscode_engine(shim)
+    if engine:
+        # Every CLI run below, and the exec that replaces this process, needs it.
+        os.environ["ELECTRON_RUN_AS_NODE"] = "1"
+    return engine
+
+
+def cli_target(row):
+    """Options that let the CLI read this container's devcontainer.json, if this host still has it."""
+    labels = row.get("cli_labels") or {}
+    folder, config = labels.get("devcontainer.local_folder"), labels.get("devcontainer.config_file")
+    if not folder or not os.path.isdir(folder) or (config and not os.path.isfile(config)):
+        return []
+    # Exact id labels: the CLI must find this container, never build a new one.
+    return ["--workspace-folder", folder, *(["--config", config] if config else []),
+            *(part for name, value in labels.items() for part in ("--id-label", f"{name}={value}"))]
+
+
+# VS Code sets this for lifecycle commands and terminals alike.
+REMOTE_ENV = ["--remote-env", "REMOTE_CONTAINERS=true"]
+# VS Code's copy of a host file into the container: only where none is yet, and only where the
+# command that reads it exists. "$1" is the path in the container, "$2" that command.
+COPY = """f=$1
+[ -e "$f" ] {in_use}&& exit 1
+command -v "$2" >/dev/null 2>&1 || exit 1
+d=$(dirname "$f")
+mkdir -p "$d" && [ -w "$d" ] || exit 1
+cat >>"$f"
+"""
+# A ~/.gitconfig that holds only [filter] or [safe] sections still gets the host's appended.
+GITCONFIG_IN_USE = """&& grep -e '^\\[' "$f" | grep -v -E '^\\[(filter|safe)([[:blank:]]+|\\])' >/dev/null """
+# VS Code's cleanup after copying git config. VS Code keeps its own `code` editor; Herdr has none.
+GIT_CLEANUP = """for key in core.editor core.sshCommand gpg.program gpg.openpgp.program gpg.x509.program gpg.ssh.program
+do
+\tvalue="$(git config --global --get $key)"
+\texecutable="${value%% *}"
+\t[ -z "$executable" ] && continue
+\tcommand -v "$executable" >/dev/null 2>&1 || (echo "Removing Git config key: $key = $value" && git config --global --unset $key)
+done
+git config --global --unset http.sslBackend || true
+"""
+
+
+def jsonc(text):
+    """VS Code's settings.json (comments, trailing commas) as plain JSON."""
+    parts, i = [], 0
+    while i < len(text):
+        if text[i] == '"':
+            j = i + 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            parts.append((True, text[i:j + 1]))
+            i = j + 1
+        elif text.startswith("//", i):
+            i = text.find("\n", i) % (len(text) + 1)
+        elif text.startswith("/*", i):
+            i = (text.find("*/", i + 2) % (len(text) + 1)) + 2
+        else:
+            parts.append((False, text[i]))
+            i += 1
+    out, plain = [], ""
+    for is_string, piece in parts + [(True, "")]:
+        if is_string:
+            out += [re.sub(r",(\s*[}\]])", r"\1", plain), piece]
+            plain = ""
+        else:
+            plain += piece
+    return "".join(out)
+
+
+def vscode_settings():
+    """The person's VS Code user settings, which VS Code's own open of a container follows."""
+    try:
+        with open(os.path.join(vscode_user(), "settings.json"), encoding="utf-8") as stream:
+            settings = json.loads(jsonc(stream.read()))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def up_argv(cli, docker, target):
+    # VS Code's open of an existing container: initializeCommand, then start it (compose: its
+    # services). The lifecycle commands follow, phase by phase.
+    return [*cli, "up", "--docker-path", docker, *target, "--expect-existing-container", "--skip-post-create"]
+
+
+def last_json(raw):
+    try:
+        value = json.loads(raw.decode(errors="replace").strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def log_file(row):
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    folder = os.path.join(state, "hc-devcontainer")
+    os.makedirs(folder, exist_ok=True)
+    # Unbuffered: the CLI writes to the same file.
+    return open(os.path.join(folder, f"{row['name']}.log"), "wb", buffering=0)
+
+
+def detach(work, log):
+    """Run work in a child that outlives the connection and holds none of core's pipes."""
+    if os.fork():
+        return
+    try:
+        os.setsid()
+        os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+        os.dup2(log.fileno(), 1)
+        os.dup2(log.fileno(), 2)
+        work()
+    except BaseException as error:  # noqa: BLE001 - the child must always exit here
+        os.write(2, f"hc-devcontainer: {error}\n".encode())
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        os._exit(0)
+
+
+class Session:
+    """One connection's version of VS Code's open sequence against one container."""
+
+    def __init__(self, cli, docker, container_id, target, user, log):
+        self.cli, self.docker, self.id, self.target, self.user, self.log = cli, docker, container_id, target, user, log
+        self.settings = vscode_settings()
+        # VS Code caches userEnvProbe per window session in the container the same way.
+        self.data = f"/tmp/devcontainers-{uuid.uuid4()}"
+        self._home = None
+
+    def note(self, message):
+        self.log.write(f"hc-devcontainer: {message}\n".encode())
+
+    def sh(self, script, data=b"", *args):
+        """Run a script in the container as the remote user, as VS Code's shell server does."""
+        argv = [self.docker, "exec", "-i", *(["-u", self.user] if self.user else []), self.id, "sh", "-c", script, "sh", *args]
+        return subprocess.run(argv, input=data, stdout=self.log, stderr=self.log, check=False).returncode
+
+    def cli_sh(self, script, data=b""):
+        # With the userEnvProbe environment, so tools on the user's PATH are found.
+        argv = [*self.cli, "exec", "--docker-path", self.docker, "--container-id", self.id, *self.target,
+                *REMOTE_ENV, "sh", "-c", script]
+        return subprocess.run(argv, input=data, stdout=self.log, stderr=self.log, check=False).returncode
+
+    def copy(self, host, remote, needs, in_use=""):
+        try:
+            with open(host, "rb") as stream:
+                data = stream.read()
+        except OSError:
+            return False
+        return self.sh(COPY.format(in_use=in_use), data, remote, needs) == 0
+
+    def dotfiles(self):
+        flags = {"repository": "--dotfiles-repository", "installCommand": "--dotfiles-install-command",
+                 "targetPath": "--dotfiles-target-path"}
+        values = {flag: self.settings.get(f"dotfiles.{key}") for key, flag in flags.items()}
+        if not (isinstance(values["--dotfiles-repository"], str) and values["--dotfiles-repository"]):
+            return []
+        return [part for flag, value in values.items() if isinstance(value, str) and value for part in (flag, value)]
+
+    def hooks(self, blocking, stop):
+        """One phase of the lifecycle commands; returns where the CLI stopped, or None on failure."""
+        argv = [*self.cli, "run-user-commands", "--docker-path", self.docker, "--container-id", self.id,
+                *self.target, *REMOTE_ENV, "--container-session-data-folder", self.data, *self.dotfiles(),
+                *(["--skip-non-blocking-commands"] if blocking else []),
+                *(["--stop-for-personalization"] if stop else [])]
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=self.log, check=False)
+        self.log.write(result.stdout)
+        if result.returncode:
+            self.note("a lifecycle command failed; the rest are skipped")
+            return None
+        return last_json(result.stdout).get("result")
+
+    def home(self):
+        # The remote user's home; docker exec -u sets HOME from passwd.
+        if self._home is None:
+            found = subprocess.run([self.docker, "exec", *(["-u", self.user] if self.user else []), self.id,
+                                    "sh", "-c", 'printf %s "$HOME"'], capture_output=True, check=False)
+            self._home = found.stdout.decode(errors="replace") if not found.returncode and found.stdout else "/root"
+        return self._home
+
+    def known_hosts(self):
+        host = os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+        self.copy(host, posixpath.join(self.home(), ".ssh", "known_hosts"), "ssh")
+
+    def personalize(self):
+        """What VS Code does after dotfiles: copy the host's git config, unless that is turned off."""
+        if self.settings.get("dev.containers.copyGitConfig", True) is False:
+            return
+        home, remote = os.path.expanduser("~"), self.home()
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        copied = self.copy(os.path.join(home, ".gitconfig"), posixpath.join(remote, ".gitconfig"), "git",
+                           GITCONFIG_IN_USE)
+        copied = self.copy(os.path.join(xdg, "git", "config"), posixpath.join(remote, ".config", "git", "config"),
+                           "git") or copied
+        if not copied:
+            return
+        self.sh(GIT_CLEANUP)
+        signers = host_git_config("gpg.ssh.allowedSignersFile")
+        if signers:
+            path = os.path.abspath(os.path.join(home, os.path.expanduser(signers)))
+            inside = posixpath.normpath(posixpath.join(remote, os.path.relpath(path, home).replace(os.sep, "/")))
+            if self.copy(path, inside, "ssh"):
+                self.sh('git config --global gpg.ssh.allowedSignersFile "$1"', b"", inside)
+
+    def gh_login(self):
+        """VS Code logs the container's GitHub CLI in with the host's token, unless turned off."""
+        if self.settings.get("dev.containers.githubCLILoginWithToken", True) is False or not shutil.which("gh"):
+            return
+        if self.cli_sh("command -v gh >/dev/null 2>&1 && ! gh auth status >/dev/null 2>&1"):
+            return
+        token = subprocess.run(["gh", "auth", "token"], capture_output=True, check=False)
+        if not token.returncode and token.stdout.strip():
+            self.cli_sh("gh auth login --with-token", token.stdout.strip())
+
+
+def host_git_config(key):
+    if not shutil.which("git"):
+        return ""
+    found = subprocess.run(["git", "config", "--global", "--get", key], capture_output=True, text=True, check=False)
+    return found.stdout.rstrip("\r\n") if not found.returncode else ""
+
+
+def open_like_vs_code(cli, docker, row, container_id, target):
+    """VS Code's open sequence; returns (exec target, remote user), or None if the CLI cannot run."""
+    log = log_file(row)
+    user = row["user"]
+    if target:
+        up = subprocess.run(up_argv(cli, docker, target), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=log, check=False)
+        log.write(up.stdout)
+        if up.returncode == 127:
+            print("hc-devcontainer: the devcontainer CLI cannot run; using docker exec", file=sys.stderr)
+            return None
+        if up.returncode:
+            print(f"hc-devcontainer: devcontainer up failed; lifecycle commands skipped (see {log.name})",
+                  file=sys.stderr)
+            target = []
+        else:
+            user = last_json(up.stdout).get("remoteUser") or user
+    session = Session(cli, docker, container_id, target, user, log)
+    session.known_hosts()
+    first = then = None
+    if target:
+        # VS Code's phases: blocking commands (to waitFor) and personalization before the window
+        # connects; the rest in the background. The CLI's markers keep each command to its once.
+        first = session.hooks(blocking=True, stop=True)
+        if first == "stopForPersonalization":
+            session.personalize()
+            then = session.hooks(blocking=True, stop=False)
+    else:
+        session.personalize()
+
+    def background():
+        session.gh_login()
+        if first == "skipNonBlocking":
+            if session.hooks(blocking=False, stop=True) == "stopForPersonalization":
+                session.personalize()
+                session.hooks(blocking=False, stop=False)
+        elif then == "skipNonBlocking":
+            session.hooks(blocking=False, stop=False)
+
+    detach(background, log)
+    return target, user
+
+
+def connect(docker, row, container_id, line):
+    """Open and attach the way VS Code does, then exec with its user, env and folder."""
+    cli = devcontainer_cli()
+    opened = open_like_vs_code(cli, docker, row, container_id, cli_target(row)) if cli else None
+    if opened is None:
+        return exec_container(docker, row, container_id, line)
+    target, user = opened
+    # The CLI sets remoteUser, userEnvProbe and remoteEnv, and with the config, the workspace folder.
+    workspace = [] if target or not row.get("workspace") else [row["workspace"]]
+    argv = [*cli, "exec", "--docker-path", docker, "--container-id", container_id, *target, *REMOTE_ENV,
+            "sh", "-c", WRAPPER, "sh", line, *workspace]
+    serve_in_background(docker, container_id, user)
+    os.execvp(argv[0], argv)
+
+
+def start(docker, container_id):
+    cli = devcontainer_cli()
+    found = rows(inspect(docker, [container_id])) if cli else []
+    target = cli_target(found[0]) if found else []
+    if target:
+        result = subprocess.run(up_argv(cli, docker, target), stdin=subprocess.DEVNULL,
+                                capture_output=True, check=False)
+        if not result.returncode:
+            return
+        message = last_json(result.stdout).get("message") or result.stderr.decode(errors="replace").strip()
+        print(f"hc-devcontainer: devcontainer up failed ({message or result.returncode}); using docker start",
+              file=sys.stderr)
+    run([docker, "start", container_id])
 
 
 def exec_container(docker, row, container_id, line):
@@ -542,6 +890,10 @@ def rows(containers):
             "suggested_name": machine_name(folder if folder else name),
             "created": item.get("Created", ""),
         }
+        cli_labels = {key: labels[key] for key in ("devcontainer.local_folder", "devcontainer.config_file")
+                      if labels.get(key)}
+        if cli_labels:
+            row["cli_labels"] = cli_labels
         remote_env = metadata_remote_env(raw, config.get("Env"))
         if remote_env:
             row["remote_env"] = remote_env
@@ -597,6 +949,7 @@ def main(argv=None):
             for row in found:
                 row.pop("created")
                 row.pop("remote_env", None)
+                row.pop("cli_labels", None)
             print(json.dumps(found))
         else:
             for row in found:
@@ -607,7 +960,7 @@ def main(argv=None):
         parser = argparse.ArgumentParser(prog="hc-devcontainer start")
         parser.add_argument("id")
         args = parser.parse_args(argv[1:])
-        run([docker, "start", args.id])
+        start(docker, args.id)
         return 0
 
     if argv and argv[0] == "serve":
@@ -641,7 +994,7 @@ def main(argv=None):
         found = [row for row in rows(inspect(docker, [args.container])) if row["state"] == "running"]
         if not found:
             raise RuntimeError(f"container {args.container!r} is not running")
-        return exec_container(docker, found[0], found[0]["name"], args.args[0]) or 0
+        return connect(docker, found[0], found[0]["name"], args.args[0]) or 0
     if len(args.args) != 2:
         parser.error("expected <folder> <line>, or --container NAME <line>")
     folder, line = args.args
@@ -653,7 +1006,7 @@ def main(argv=None):
     found.sort(key=lambda row: row["created"], reverse=True)
     if len(found) > 1:
         print(f"hc-devcontainer: {len(found)} containers match; using newest {found[0]['id']}", file=sys.stderr)
-    return exec_container(docker, found[0], found[0]["id"], line) or 0
+    return connect(docker, found[0], found[0]["id"], line) or 0
 
 
 if __name__ == "__main__":

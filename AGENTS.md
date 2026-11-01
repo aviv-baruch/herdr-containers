@@ -38,6 +38,18 @@ only hand-written mod; its tests are in `test/test_containers.cjs`.
   --install`) and core runs it for every connection, so both PATHs need it. If
   core's PATH lacks it, the shell exits 127 and `hc machine add` can say “hc is
   not installed.” Restart core after a PATH change.
+- With the `devcontainer` CLI on core's PATH, every connection replays VS
+  Code's open (read from the extension's bundle; see README "VS Code
+  parity"): `up --skip-post-create`, then `run-user-commands` phases split by
+  `--skip-non-blocking-commands` / `--stop-for-personalization`, with VS Code's
+  personalization between, the rest in a forked child, then `devcontainer
+  exec`. Without the CLI, or when it exits 127 (no `node`), the helper uses
+  `docker exec`. `up` always gets `--expect-existing-container` and exact id
+  labels: it must never build. stdout is the connection and stdin is core's:
+  CLI output goes to the log, and the forked child must hold neither pipe.
+  The engine is VS Code's own when its `cli-bin` record exists (Electron with
+  `ELECTRON_RUN_AS_NODE=1`); VS Code's `devcontainer` shim has only
+  open/build and must never be run. Tests pin `HC_DEVCONTAINER_CLI=""`.
 - Shipped Spaces caches machines for 15 s; the app polls `machine.list`
   about every 2.5 s. `space.close` only queues closure.
 - Tests and smokes use isolated `HC_SESSION` and scratch `HERDR_APP_HOME`.

@@ -17,6 +17,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 
 - Herdr app 0.1.10 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
+- Recommended, so dev containers open exactly as in VS Code: VS Code with its Dev Containers extension on this host (the helper runs the extension's own engine with VS Code's Electron; nothing else to install), or the [Dev Containers CLI](https://github.com/devcontainers/cli) (`npm install -g @devcontainers/cli`, which needs Node.js) on the PATH seen by both app and core. Without either, the helper uses plain `docker exec`. See [VS Code parity](#vs-code-parity).
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
 - On Windows: Python 3 (the `py` launcher, or `python`), the two launchers in `requirements/windows/`, and for connecting, Git for Windows' `sh` and a Herdr Core that accepts `--via` there. See [Windows](#windows).
 - Optional: the [Herdr Core Feature](requirements/feature/herdr-core/README.md) to preserve core state across dev container rebuilds.
@@ -153,7 +154,7 @@ Click a group header to collapse its rows while retaining the count. Click the C
 
 | Case | Behavior |
 | --- | --- |
-| Stop/start | Stopped dev containers stay listed; **Start** runs `docker start`. A stopped plain container with a machine stays listed too. The machine reconnects in about 2–4 s with the same core id. Agents running in the container die when it stops. |
+| Stop/start | Stopped dev containers stay listed; **Start** runs `devcontainer up` like VS Code's open (or `docker start` without the CLI); lifecycle commands follow on connect. A stopped plain container with a machine stays listed too. The machine reconnects in about 2–4 s with the same core id. Agents running in the container die when it stops. |
 | Docker daemon restart | Dev containers stay stopped without a restart policy; use **Start**. The machine reconnects in about 2–4 s with the same id. |
 | Rebuild with Feature | The preserved state volume keeps the same core id; Herdr reconnects automatically. |
 | Rebuild without Feature | Use **Repair** on the unreachable machine row. It adds the container under a spare name first, then removes the old machine and renames the new one, so a failed add leaves the old machine untouched. It opens a new space if needed. |
@@ -164,7 +165,42 @@ Click a group header to collapse its rows while retaining the count. Click the C
 | Host core restart | Machines reconnect. |
 | Duplicate folder | The newest running container wins; the connector warns on stderr. |
 
-The workspace follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell) and applies `remoteEnv` from `devcontainer.json` (values pass through the environment, never the command line). `userEnvProbe` does not apply.
+The space folder follows the closest bind mount containing the local folder. Otherwise it uses the container's `WorkingDir`; `/` or an empty value leaves the space folder unset. Remote terminals use that user's `HOME` if available, or the core's current directory. Like VS Code's terminal, it starts the user's passwd shell (interactive, not a `-l` login shell).
+
+### VS Code parity
+
+`hc-devcontainer` runs VS Code's own open sequence, read from the Dev Containers extension (0.471.0), through the Dev Containers CLI engine. It picks the engine in this order:
+
+1. `HC_DEVCONTAINER_CLI`, a command line (empty means always `docker exec`).
+2. VS Code's own: the extension's bundled `dist/spec-node/devContainersSpecCLI.js`, run by VS Code's Electron with `ELECTRON_RUN_AS_NODE=1`, exactly as VS Code's `devcontainer` command runs it. The extension records both paths under `globalStorage/ms-vscode-remote.remote-containers/cli-bin/` in VS Code's User folder each time it activates, so this is always the version your VS Code uses. `HC_DEVCONTAINER_VSCODE_USER` names another User folder (for example `~/.config/Code - Insiders/User`).
+3. A `devcontainer` command on PATH from `@devcontainers/cli`. VS Code's **Install devcontainer CLI** command offers only `open` and `build`, so the helper never runs it itself; it uses the engine it names instead.
+
+Each connection, including core's reconnects, is one VS Code "open":
+
+1. `devcontainer up --expect-existing-container --skip-post-create`: runs `initializeCommand` on the host and starts the container (for Compose, its services). It uses the container's own `devcontainer.local_folder` and `devcontainer.config_file` labels and never builds or replaces a container.
+2. Copies the host's `~/.ssh/known_hosts` into the remote user's home if it has none and has `ssh`.
+3. Lifecycle commands with `REMOTE_CONTAINERS=true`, as VS Code splits them: `onCreateCommand` and `updateContentCommand` (through `waitFor`) block, then the connection opens and the rest runs in the background. Every command runs once when it should: create commands once per container, `postStartCommand` once per start, `postAttachCommand` on every connection.
+4. Personalization, at the same point as VS Code (after `postCreateCommand`): dotfiles from your VS Code settings (`dotfiles.repository`, `dotfiles.installCommand`, `dotfiles.targetPath`). Then, unless `dev.containers.copyGitConfig` is off, the host's `~/.gitconfig` and `~/.config/git/config` are copied where the container has none, VS Code's Git config cleanup runs, and the `gpg.ssh.allowedSignersFile` is copied.
+5. In the background, unless `dev.containers.githubCLILoginWithToken` is off: if the container has `gh` and it is logged out, it is logged in with the host's `gh auth token`.
+6. The connection runs through `devcontainer exec`: `remoteUser`, `userEnvProbe` (a login interactive shell by default, so `.bashrc`, `.profile`, nvm and similar apply), `remoteEnv` with all its variables, `REMOTE_CONTAINERS=true`, and the workspace folder. Herdr Core and every terminal and agent it starts inherit that.
+
+Settings come from `settings.json` in VS Code's User folder (`~/.config/Code/User` on Linux, `~/Library/Application Support/Code/User` on macOS). Without one, VS Code's defaults apply. Output goes to `${XDG_STATE_HOME:-~/.local/state}/hc-devcontainer/<container>.log`, rewritten on each connection. **Start** is step 1 alone; the rest follows when the container connects. Plain containers get steps 2, 4 (Git config only), 5 and 6, as VS Code's **Attach to Running Container** does.
+
+`devcontainer.json` is read from the host on each connection, as VS Code reads it on each open, so `remoteEnv` edits apply on the next reconnect without a rebuild. As in VS Code, `waitFor` and other values merged into the container's metadata at build time need a rebuild. If that file is gone from this host, or `up` fails, the helper still connects with `devcontainer exec --container-id`, using the container's metadata; a warning goes to stderr.
+
+What VS Code does that this cannot, and why:
+
+| VS Code | Why not here |
+| --- | --- |
+| Git credential helper, SSH and GPG agent forwarding, the Wayland socket | VS Code serves these from its own server in the container, which reaches back to the host over its connection. Herdr Core's connection can't carry them, and this package must not change Herdr or core. The links and ports relay below shows a separate `docker exec` can, but these run the other way (container to host) and would need a listener inside the container; not done yet. Meanwhile use `gh auth` (step 5) for HTTPS Git, or mount an SSH agent socket in `mounts`. |
+| `forwardPorts` forwarded before anything listens | Ports are forwarded once the container listens on them, as VS Code's automatic forwarding does (below). |
+| Keeps `core.editor = code` in the copied Git config | That works only with VS Code's `code` command in the container; here the cleanup removes it like any other missing editor. |
+| Stops the container when its last window closes (`shutdownAction`) | Herdr runs long-lived agents, and **Disconnect** deliberately leaves the container running. |
+| Builds a missing container, and offers to rebuild when the config changes | The panel opens existing containers only; rebuild with VS Code or `devcontainer up`, then use **Repair**. |
+| Per-container attach configs for **Attach to Running Container** (in VS Code's private storage) | Not read; plain containers use their image metadata. |
+| Extensions, VS Code server and machine settings | Editor-only. |
+
+Without an engine, or when it cannot run (for example `node` missing from core's PATH), the helper falls back to `docker exec`: no lifecycle commands, personalization or `userEnvProbe`, but `remoteEnv` is applied (values pass through the environment, never the command line). On Windows the helper always uses `docker exec`, since the CLI's `devcontainer.cmd` shim would make `cmd` re-parse the connection line. With the CLI, `remoteEnv` values appear on the `docker exec` command line it runs, as they do with VS Code's.
 
 Links work like VS Code's. While Herdr is connected, the container's `BROWSER` points to a helper that opens each http(s) URL with the host's browser (`wslview` or `explorer.exe` on WSL, `xdg-open` on Linux, `open` on macOS, `explorer.exe` on Windows), unless its config sets `BROWSER` itself. Ports the container listens on (localhost or all interfaces) are forwarded to the same port on the host's `127.0.0.1`, so clicked `http://localhost:3000` links and login callbacks reach the container. A port already taken on the host is forwarded to a free one, which only links opened through `BROWSER` follow. Forwarding runs over `docker exec` and needs `python3`, `bash`, or `nc` in the container. A core that was already running keeps its old environment, so `BROWSER` arrives after the core restarts (restart the container or run `hc machine update <machine>`). On WSL, if links outside containers fail too, install `wslu` so the app's `xdg-open` reaches Windows.
 
