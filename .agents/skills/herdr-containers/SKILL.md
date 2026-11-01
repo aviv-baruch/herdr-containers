@@ -100,7 +100,7 @@ mods other people made"). The app home is
 | "cannot reach … cannot run it" on Windows | Core can't find `sh`. Put Git for Windows' `C:\Program Files\Git\bin` on core's PATH, then restart core. |
 | "hc is not installed" right after adding | Core can't find `hc-devcontainer` (sh exits 127). Put it on core's PATH, restart core. |
 | Hooks or dotfiles don't run, tools from `.bashrc`/nvm missing in terminals | No engine found, so the helper fell back to `docker exec`. Open VS Code once with Dev Containers (it records its engine), or install `@devcontainers/cli` with Node.js where core sees them, then restart core. Output: `~/.local/state/hc-devcontainer/<container>.log`. |
-| Git push asks for credentials, no SSH agent in the container | VS Code forwards these through its own server; Herdr can't. Use `gh auth login` on the host (copied in on connect), or mount an SSH agent socket in `devcontainer.json`. |
+| Git push asks for credentials, no SSH agent in the container | VS Code forwards these from its own server; this package doesn't yet. Use `gh auth login` on the host (copied in on connect), or mount an SSH agent socket in `devcontainer.json`. |
 | "Docker isn't running" | Start Docker. Dev containers stay stopped: use **Start** on the row. |
 | Dev container listed under Other containers | It has no folder label (`devcontainer.local_folder` or `vsch.local.folder`) and isn't a `vsc-*` image with devcontainer metadata. Start it with VS Code or `devcontainer up`. |
 | Row shows **Repair** | Rebuilt without the Feature (new core id). Click Repair; add the Feature to avoid it. |
@@ -108,4 +108,5 @@ mods other people made"). The app home is
 | Spaces/agents show **Disconnected** | Their container or Docker is down (swaps only); they come back when it is. |
 | Spaces group lingers after Disconnect; no Disconnected agents; no Settings → Containers | The swaps aren't installed (Install step 5). |
 | Ctrl+Shift+Y does nothing | keys.json not merged, a renamed mod still bound as `containers.toggle`, or the block id isn't `containers`. |
+| Links from a container don't open, or `localhost` links don't load | Needs this `hc-devcontainer` on core's PATH and a reconnect; `BROWSER` reaches terminals after core restarts (`hc machine update <machine>`). Forwarding needs `python3`, `bash`, or `nc` in the container. On WSL, links that fail everywhere need `wslu`. |
 | Timed out / Herdr hasn't loaded it | Click the row again; Herdr's machine list lags a few seconds. |

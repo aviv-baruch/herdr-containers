@@ -192,7 +192,8 @@ What VS Code does that this cannot, and why:
 
 | VS Code | Why not here |
 | --- | --- |
-| Git credential helper, SSH agent and GPG agent forwarding, `forwardPorts`, the `BROWSER` opener, the Wayland socket | VS Code runs its own server in the container and tunnels sockets back to the host over that connection. Herdr's only channel into the container is Herdr Core's own connection, which carries no socket forwarding, and this package must not change Herdr or core. Use an SSH agent socket in `mounts`, or `gh auth` (step 5) for HTTPS Git. |
+| Git credential helper, SSH and GPG agent forwarding, the Wayland socket | VS Code serves these from its own server in the container, which reaches back to the host over its connection. Herdr Core's connection can't carry them, and this package must not change Herdr or core. The links and ports relay below shows a separate `docker exec` can, but these run the other way (container to host) and would need a listener inside the container; not done yet. Meanwhile use `gh auth` (step 5) for HTTPS Git, or mount an SSH agent socket in `mounts`. |
+| `forwardPorts` forwarded before anything listens | Ports are forwarded once the container listens on them, as VS Code's automatic forwarding does (below). |
 | Keeps `core.editor = code` in the copied Git config | That works only with VS Code's `code` command in the container; here the cleanup removes it like any other missing editor. |
 | Stops the container when its last window closes (`shutdownAction`) | Herdr runs long-lived agents, and **Disconnect** deliberately leaves the container running. |
 | Builds a missing container, and offers to rebuild when the config changes | The panel opens existing containers only; rebuild with VS Code or `devcontainer up`, then use **Repair**. |
@@ -200,6 +201,8 @@ What VS Code does that this cannot, and why:
 | Extensions, VS Code server and machine settings | Editor-only. |
 
 Without an engine, or when it cannot run (for example `node` missing from core's PATH), the helper falls back to `docker exec`: no lifecycle commands, personalization or `userEnvProbe`, but `remoteEnv` is applied (values pass through the environment, never the command line). On Windows the helper always uses `docker exec`, since the CLI's `devcontainer.cmd` shim would make `cmd` re-parse the connection line. With the CLI, `remoteEnv` values appear on the `docker exec` command line it runs, as they do with VS Code's.
+
+Links work like VS Code's. While Herdr is connected, the container's `BROWSER` points to a helper that opens each http(s) URL with the host's browser (`wslview` or `explorer.exe` on WSL, `xdg-open` on Linux, `open` on macOS, `explorer.exe` on Windows), unless its config sets `BROWSER` itself. Ports the container listens on (localhost or all interfaces) are forwarded to the same port on the host's `127.0.0.1`, so clicked `http://localhost:3000` links and login callbacks reach the container. A port already taken on the host is forwarded to a free one, which only links opened through `BROWSER` follow. Forwarding runs over `docker exec` and needs `python3`, `bash`, or `nc` in the container. A core that was already running keeps its old environment, so `BROWSER` arrives after the core restarts (restart the container or run `hc machine update <machine>`). On WSL, if links outside containers fail too, install `wslu` so the app's `xdg-open` reaches Windows.
 
 ## For agents
 

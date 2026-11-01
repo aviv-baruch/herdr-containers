@@ -5,13 +5,18 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest.mock import patch
 from contextlib import redirect_stdout, redirect_stderr
 
@@ -23,6 +28,13 @@ helper = importlib.util.module_from_spec(spec)
 loader.exec_module(helper)
 # The docker exec fallback, whatever this machine has; CliTests turn the Dev Containers CLI on.
 os.environ["HC_DEVCONTAINER_CLI"] = ""
+
+
+def setUpModule():
+    # Connecting starts a real background `serve`; tests that want it patch it again.
+    patcher = patch.object(helper, "serve_in_background")
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 def done(stdout="", code=0, stderr=""):
@@ -621,9 +633,14 @@ class WindowsHostTests(unittest.TestCase):
     def test_windows_runs_docker_exec_as_a_child_and_passes_its_code(self):
         row = {"user": "me", "workspace": "/w"}
         with patch.object(helper, "WINDOWS", True), patch.object(helper.os, "execvpe") as execvpe, \
+                patch.object(helper, "Server") as server, patch.object(helper, "serve_in_background") as serve, \
                 patch.object(helper.subprocess, "run", return_value=done(code=3)) as run:
             self.assertEqual(helper.exec_container("docker", row, "id", "true"), 3)
         execvpe.assert_not_called()
+        # Windows keeps no orphan to watch the connection: it serves in-process and stops after.
+        server.assert_called_once_with("docker", "id", "me")
+        server.return_value.stop.assert_called_once_with()
+        serve.assert_not_called()
         run.assert_called_once_with(helper.exec_argv("docker", "id", "me", "true", {}, "/w"),
                                     env=dict(os.environ), check=False)
 
@@ -744,10 +761,12 @@ class CliTests(unittest.TestCase):
                 patch.object(helper, "folder_ids", return_value=["dev-id"]), \
                 patch.object(helper.subprocess, "run", side_effect=run), \
                 patch.object(helper, "detach", side_effect=lambda work, log: (steps.append("|"), work())), \
+                patch.object(helper, "serve_in_background") as serve, \
                 patch.object(helper.os, "execvp") as execvp, \
                 patch.object(helper.os, "execvpe") as execvpe, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(helper.main(argv), 0)
-        return SimpleNamespace(steps=steps, calls=calls, execvp=execvp, execvpe=execvpe, errors=errors.getvalue())
+        return SimpleNamespace(steps=steps, calls=calls, execvp=execvp, execvpe=execvpe, serve=serve,
+                               errors=errors.getvalue())
 
     def engine(self, bin_dir):
         """VS Code's record of its engine, as the extension writes it on activation."""
@@ -838,6 +857,8 @@ class CliTests(unittest.TestCase):
         got.execvp.assert_called_once_with("devcontainer", [
             "devcontainer", "exec", *common, "--container-id", "dev-id", *self.target,
             "--remote-env", "REMOTE_CONTAINERS=true", "sh", "-c", helper.WRAPPER, "sh", "printf hi"])
+        # Links and ports are served as the remoteUser up reported.
+        got.serve.assert_called_once_with("podman", "dev-id", "vscode")
         # Copies run as the remoteUser up reported, with the host file on stdin.
         copy = next((cmd, kw) for cmd, kw in got.calls if cmd[:2] == ["podman", "exec"] and cmd[-1] == "ssh")
         self.assertEqual(copy[0][:6], ["podman", "exec", "-i", "-u", "vscode", "dev-id"])
@@ -902,6 +923,7 @@ class CliTests(unittest.TestCase):
         got.execvp.assert_called_once_with("devcontainer", [
             "devcontainer", "exec", "--docker-path", "docker", "--container-id", "web",
             "--remote-env", "REMOTE_CONTAINERS=true", "sh", "-c", helper.WRAPPER, "sh", "true", "/app"])
+        got.serve.assert_called_once_with("docker", "web", "app")
 
     def test_start_opens_folder_dev_containers_like_vs_code(self):
         stopped = copy.deepcopy(self.dev)
@@ -989,6 +1011,239 @@ class VsCodeScriptTests(unittest.TestCase):
                 __import__("time").sleep(0.05)
             self.assertTrue(marker.exists())
             self.assertEqual(log.read_text(), "child\n")
+
+def run_script(script, *args, env=None, **kwargs):
+    return subprocess.run(["/bin/sh", "-c", script, "sh", *args], env=env, capture_output=True, text=True,
+                          check=False, **kwargs)
+
+
+def echo_server():
+    """Uppercases what each client sends; closes a client on "bye"."""
+    server = socket.create_server(("127.0.0.1", 0))
+
+    def talk(client):
+        with client:
+            while (data := client.recv(4096)) and data != b"bye\n":
+                client.sendall(data.upper())
+
+    def loop():
+        while True:
+            try:
+                client, _ = server.accept()
+            except OSError:
+                return
+            threading.Thread(target=talk, args=(client,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return server
+
+
+def read_within(stream, seconds=5):
+    ready, _, _ = select.select([stream], [], [], seconds)
+    return os.read(stream.fileno(), 4096) if ready else b"(nothing)"
+
+
+class BrowserTests(unittest.TestCase):
+    def test_wrapper_sets_a_private_browser_helper_only_when_unset(self):
+        argv = helper.exec_argv("docker", "abc", None, 'printf "%s\\n" "$BROWSER"')
+        with tempfile.TemporaryDirectory() as home:
+            env = {"HOME": home, "PATH": os.environ["PATH"], "SHELL": "/bin/sh"}
+            result = run_script(argv[-3], *argv[-1:], env=env)
+            self.assertEqual((result.returncode, result.stderr), (0, ""))
+            path = Path(home) / ".cache" / "herdr-containers" / "browser"
+            self.assertEqual(result.stdout, f"{path}\n")
+            self.assertEqual(path.read_text(), helper.BROWSER_HELPER)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["browser"])
+            result = run_script(argv[-3], *argv[-1:], env={**env, "BROWSER": "mine"})
+            self.assertEqual(result.stdout, "mine\n")
+        with tempfile.TemporaryDirectory() as temp:
+            unwritable = Path(temp) / "ro"
+            unwritable.mkdir(mode=0o500)
+            result = run_script(argv[-3], *argv[-1:], env={**env, "HOME": str(unwritable)})
+            self.assertEqual(result.returncode, 0)
+            if os.geteuid():  # root writes anyway
+                self.assertEqual((result.stdout, result.stderr), ("\n", ""))
+
+    def test_helper_queues_for_a_live_listener_and_prints_otherwise(self):
+        with tempfile.TemporaryDirectory() as temp:
+            browser = Path(temp) / "browser"
+            browser.write_text(helper.BROWSER_HELPER)
+            browser.chmod(0o755)
+            result = subprocess.run([str(browser), "https://a.test/x"], capture_output=True, text=True)
+            self.assertEqual((result.returncode, result.stdout), (1, ""))
+            self.assertEqual(result.stderr, "Open this link: https://a.test/x\n")
+            (Path(temp) / "serve.lock").mkdir()
+            (Path(temp) / "serve.lock" / "pid").write_text(f"{os.getpid()}\n")  # alive, not a listener
+            result = subprocess.run([str(browser), "https://a.test/x"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            listener = subprocess.Popen(["/bin/sh", "-c", "# hc-devcontainer-serve\nsleep 30"])
+            try:
+                (Path(temp) / "serve.lock" / "pid").write_text(f"{listener.pid}\n")
+                result = subprocess.run([str(browser), "https://a.test/1", "http://localhost:3000/"],
+                                        capture_output=True, text=True)
+            finally:
+                listener.kill()
+                listener.wait()
+            self.assertEqual((result.returncode, result.stderr), (0, ""))
+            self.assertEqual((Path(temp) / "open").read_text(), "https://a.test/1\nhttp://localhost:3000/\n")
+
+    def test_listener_reports_opens_and_ports_and_ends_with_stdin(self):
+        with tempfile.TemporaryDirectory() as home, echo_server() as server:
+            port = server.getsockname()[1]
+            folder = Path(home) / ".cache" / "herdr-containers"
+            folder.mkdir(parents=True)
+            (folder / "open").write_text("http://stale.test/\n")
+            proc = subprocess.Popen(["/bin/sh", "-c", helper.LISTEN], env={**os.environ, "HOME": home},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                first = proc.stdout.readline()
+                self.assertTrue(first.startswith("ports "), first)
+                self.assertEqual(helper.listening(first[6:]).get(port), "127.0.0.1", first)
+                self.assertFalse((folder / "open").exists())  # stale requests are dropped
+                (folder / "open").write_text("https://a.test/\n")
+                self.assertEqual(proc.stdout.readline(), "open https://a.test/\n")
+                second = run_script(helper.LISTEN, env={**os.environ, "HOME": home}, timeout=5)
+                self.assertEqual(second.returncode, 3)
+                (Path(home) / "file").write_text("")
+                no_home = run_script(helper.LISTEN, env={**os.environ, "HOME": f"{home}/file"}, timeout=5)
+                self.assertEqual(no_home.returncode, 4)  # serve stops instead of retrying
+                proc.stdin.close()
+                self.assertNotEqual(proc.wait(timeout=5), 0)
+            finally:
+                proc.kill()
+                proc.communicate()
+            # Its lock now names a dead process: the next listener takes over.
+            proc = subprocess.Popen(["/bin/sh", "-c", helper.LISTEN], env={**os.environ, "HOME": home},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(proc.stdout.readline().startswith("ports "))
+                self.assertEqual((folder / "serve.lock" / "pid").read_text().strip(), str(proc.pid))
+            finally:
+                proc.communicate(timeout=5)
+
+    def test_listening_keeps_loopback_and_wildcard(self):
+        line = ("0100007F:0BB8 00000000:1F90 0A000002:0016 "
+                "00000000000000000000000001000000:1435 00000000000000000000000000000000:0050 "
+                "0000000000000000FFFF00000100007F:0051 0100007F:0000 junk 0100007F:zz")
+        self.assertEqual(helper.listening(line), {3000: "127.0.0.1", 8080: "127.0.0.1", 5173: "::1",
+                                                  80: "::1", 81: "127.0.0.1"})
+
+    def test_relay_carries_bytes_with_each_container_tool(self):
+        with tempfile.TemporaryDirectory() as temp, echo_server() as server:
+            port = str(server.getsockname()[1])
+            for tool in ("python3", "bash", "nc"):
+                if not shutil.which(tool):
+                    continue
+                bin_dir = Path(temp) / tool
+                bin_dir.mkdir()
+                for name in (tool, "cat", "sh"):
+                    (bin_dir / name).symlink_to(shutil.which(name))
+                with self.subTest(tool=tool):
+                    proc = subprocess.Popen(["/bin/sh", "-c", helper.RELAY, "sh", "127.0.0.1", port],
+                                            env={"PATH": str(bin_dir)}, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE)
+                    try:
+                        proc.stdin.write(b"hello relay\n")
+                        proc.stdin.flush()
+                        self.assertEqual(read_within(proc.stdout), b"HELLO RELAY\n")
+                        # The server hanging up ends the relay, so the host sees EOF.
+                        proc.stdin.write(b"bye\n")
+                        proc.stdin.flush()
+                        if tool != "nc":
+                            self.assertEqual(read_within(proc.stdout), b"")
+                    finally:
+                        proc.kill()
+                        proc.communicate()
+            empty = Path(temp) / "empty"
+            empty.mkdir()
+            self.assertEqual(run_script(helper.RELAY, "127.0.0.1", port, env={"PATH": str(empty)}).returncode, 127)
+
+    def test_host_opener(self):
+        with patch.dict(os.environ, {"HC_DEVCONTAINER_OPEN": "my-open --flag"}):
+            self.assertEqual(helper.host_opener(), ["my-open", "--flag"])
+        with patch.dict(os.environ, {"HC_DEVCONTAINER_OPEN": ""}), patch.object(helper.sys, "platform", "linux"):
+            for release, found, expected in (
+                ("6.6.87.2-microsoft-standard-WSL2", {"wslview": "/usr/bin/wslview"}, ["/usr/bin/wslview"]),
+                ("6.6.87.2-microsoft-standard-WSL2", {"explorer.exe": "/mnt/c/WINDOWS/explorer.exe"},
+                 ["/mnt/c/WINDOWS/explorer.exe"]),
+                ("6.8.0-generic", {"wslview": "/usr/bin/wslview"}, ["xdg-open"]),
+            ):
+                with self.subTest(release=release, found=found), \
+                        patch("builtins.open", unittest.mock.mock_open(read_data=release)), \
+                        patch.object(helper.shutil, "which", side_effect=found.get):
+                    self.assertEqual(helper.host_opener(), expected)
+            with patch.object(helper.sys, "platform", "darwin"):
+                self.assertEqual(helper.host_opener(), ["open"])
+            with patch.object(helper, "WINDOWS", True):
+                self.assertEqual(helper.host_opener(), ["explorer.exe"])
+
+    def test_open_sends_web_links_to_the_host_and_maps_container_ports(self):
+        server = helper.Server("docker", "abc", None)
+        opened = []
+        with patch.object(helper, "host_opener", return_value=["opener"]), \
+                patch.object(helper.subprocess, "Popen", side_effect=lambda argv, **_: opened.append(argv[1])), \
+                patch.object(server, "forward", side_effect=lambda port: {3000: 3000, 5173: 40001}.get(port)):
+            for url in ("https://example.com/a?b=1", "http://localhost:3000/cb?code=x", "http://0.0.0.0:3000/",
+                        "http://[::1]:5173/", "http://127.0.0.1:9/", "file:///etc/passwd", "javascript:alert(1)",
+                        "ssh://localhost:22", "http://[bad"):
+                server.open(url)
+        self.assertEqual(opened, ["https://example.com/a?b=1", "http://localhost:3000/cb?code=x",
+                                  "http://localhost:3000/", "http://[::1]:40001/", "http://127.0.0.1:9/"])
+
+    def test_forward_prefers_the_same_port_and_relays_through_exec(self):
+        with tempfile.TemporaryDirectory() as temp, echo_server() as target:
+            # A docker that runs the exec here: it drops `exec -i <id>`.
+            docker = Path(temp) / "docker"
+            docker.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+            docker.chmod(0o755)
+            server = helper.Server(str(docker), "abc", None)
+            try:
+                with socket.create_server(("127.0.0.1", 0)) as probe:
+                    free = probe.getsockname()[1]
+                self.assertEqual(server.forward(free), free)
+                # The target holds its own port here, so the forward takes another one.
+                port = target.getsockname()[1]
+                server.ports(f"0100007F:{port:04X} 0100007F:{free:04X}")
+                host_port = server.forwards[port][1]
+                self.assertNotIn(host_port, (port, free))
+                self.assertEqual(server.forward(port), host_port)
+                with socket.create_connection(("127.0.0.1", host_port), timeout=5) as client:
+                    client.sendall(b"through\n")
+                    self.assertEqual(client.recv(8), b"THROUGH\n")
+                    client.sendall(b"bye\n")
+                    self.assertEqual(client.recv(8), b"")
+                server.ports(f"0100007F:{free:04X}")
+                self.assertEqual(list(server.forwards), [free])
+                with self.assertRaises(OSError):
+                    socket.create_connection(("127.0.0.1", host_port), timeout=1).close()
+            finally:
+                for listener, _ in server.forwards.values():
+                    listener.close()
+
+    def test_stop_ends_the_listener_and_run(self):
+        server = helper.Server("docker", "abc", None)
+        listener = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    text=True)
+        with patch.object(helper.subprocess, "Popen", return_value=listener) as popen:
+            thread = threading.Thread(target=server.run, daemon=True)
+            thread.start()
+            for _ in range(50):
+                if server.proc:
+                    break
+                time.sleep(0.05)
+            server.stop()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(popen.call_count, 1)
+        listener.stdin.close()
+
+    def test_connecting_starts_serve_for_that_container_and_user(self):
+        row = {"user": "vscode", "workspace": ""}
+        with patch.object(helper, "serve_in_background") as serve, patch.object(helper.os, "execvpe"):
+            helper.exec_container("docker", row, "abc", "true")
+        serve.assert_called_once_with("docker", "abc", "vscode")
 
 
 if __name__ == "__main__":
