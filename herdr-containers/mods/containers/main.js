@@ -116,8 +116,11 @@ export default class Containers extends View {
     ]);
     let rows = null;
     try {
-      // cmd's "not recognized" is localized; its exit code is not.
-      if (listed.code === 9009 && onWindows()) throw new Error("cannot run hc-devcontainer: not found");
+      // cmd exits 1 for a command it can't find, in the system's language; where's code says which.
+      if (listed.code !== 0 && onWindows() && !/^hc-devcontainer:/m.test(listed.stderr ?? "")
+        && (await safe(exec("where", ["hc-devcontainer.cmd"]))).code !== 0) {
+        throw new Error("cannot run hc-devcontainer: not found");
+      }
       if (listed.code !== 0) throw new Error(errorText(listed));
       rows = JSON.parse(listed.stdout);
       if (!Array.isArray(rows)) throw new Error("invalid container list");

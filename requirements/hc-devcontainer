@@ -79,7 +79,8 @@ def base_name(path):
 
 def host_parts(path):
     """A host path as parts; a Windows drive becomes "c:" however it is spelled."""
-    if WINDOWS or not DRIVE_PATH.match(path):
+    # Windows would resolve Docker Desktop's "/run/…" against the current drive.
+    if not (DRIVE_MOUNT.match(path) if WINDOWS else DRIVE_PATH.match(path)):
         path = os.path.realpath(path)
     drive = DRIVE_PATH.match(path) or DRIVE_MOUNT.match(path)
     if drive:

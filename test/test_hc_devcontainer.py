@@ -600,6 +600,17 @@ class WindowsHostTests(unittest.TestCase):
         mounts = [{"Type": "bind", "Source": "/run/desktop/mnt/host/d/Users/Me/Proj", "Destination": "/wrong"}]
         self.assertEqual(helper.workspace_for(label, mounts, "/"), "")
 
+    def test_on_windows_docker_desktop_mounts_are_not_resolved_against_the_current_drive(self):
+        # Windows realpath makes "/run/…" into "D:\\run\\…" on whatever drive is current.
+        def realpath(path):
+            return "D:\\" + path.lstrip("/\\").replace("/", "\\") if path.startswith(("/", "\\")) else path
+
+        label = r"c:\Users\Me\Proj\Sub Dir"
+        mounts = [{"Type": "bind", "Source": "/run/desktop/mnt/host/c/users/me/Proj", "Destination": "/workspaces/Proj"}]
+        with patch.object(helper, "WINDOWS", True), patch.object(helper.os.path, "realpath", realpath):
+            self.assertTrue(helper.same_folder(r"c:\Users\Me\Proj", "/host_mnt/c/Users/Me/Proj"))
+            self.assertEqual(helper.workspace_for(label, mounts, "/"), "/workspaces/Proj/Sub Dir")
+
     def test_names_and_guesses_use_the_windows_folder_name(self):
         self.assertEqual(helper.machine_name(r"c:\Users\me\My Proj" "\\"), "my-proj")
         mounts = [{"Type": "volume", "Destination": "/workspaces/a"}, {"Type": "volume", "Destination": "/workspaces/Proj"}]
@@ -649,7 +660,7 @@ class WindowsHostTests(unittest.TestCase):
             (fake / "py").write_text(f'#!/bin/sh\n[ "$1" = -3 ] || exit 9\nshift\nexec {shlex.quote(sys.executable)} "$@"\n')
             (fake / "py").chmod(0o755)
             line = """sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x "$p" ] || exit 127'"""
-            via = f"{bin_dir}/hc-devcontainer 'c:\\Users\\Me\\My Proj'"
+            via = f"{shlex.quote((bin_dir / 'hc-devcontainer').as_posix())} 'c:\\Users\\Me\\My Proj'"
             env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
             # Exactly how core runs a via: sh -c '<via> "$1"' sh <line>.
             result = subprocess.run(["sh", "-c", f'{via} "$1"', "sh", line], env=env,

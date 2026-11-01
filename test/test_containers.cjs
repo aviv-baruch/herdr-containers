@@ -642,15 +642,32 @@ test("on Windows a helper cmd can't find reads as missing, and Docker Desktop do
   a.realRefresh();
   a.win.platform = "windows";
   a.setHc(async () => ({ code: 0, stdout: '{"machines":[]}' }));
-  // cmd's "not recognized" is localized; its exit code 9009 is not.
-  a.setExec(async () => ({ code: 9009, stdout: "", stderr: "'hc-devcontainer' n'est pas reconnu…\r\n" }));
+  // cmd exits 1 for a command it can't find, in words of the system's language: where's code says which.
+  let whereCode = 1;
+  const calls = [];
+  a.setExec(async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    if (cmd === "where") return { code: whereCode, stdout: "", stderr: "" };
+    return { code: 1, stdout: "", stderr: "'hc-devcontainer' n'est pas reconnu…\r\n" };
+  });
   a.view.refresh(a.cx);
   await settle();
   assert.equal(a.view.error, "hc-devcontainer is not installed (put it and hc-devcontainer.cmd on PATH)");
-  a.setExec(async () => ({ code: 1, stdout: "", stderr: "hc-devcontainer: error during connect: Get \"http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.47/containers/json\": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.\n" }));
+  assert.deepEqual(calls.at(-1), ["where", "hc-devcontainer.cmd"]);
+  whereCode = 0;
+  a.view.refresh(a.cx);
+  await settle();
+  assert.equal(a.view.error, "'hc-devcontainer' n'est pas reconnu…");
+  // The helper's own errors never need the look.
+  calls.length = 0;
+  a.setExec(async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    return { code: 1, stdout: "", stderr: "hc-devcontainer: error during connect: Get \"http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.47/containers/json\": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.\n" };
+  });
   a.view.refresh(a.cx);
   await settle();
   assert.equal(a.view.error, "Docker isn't running");
+  assert.equal(calls.filter(([cmd]) => cmd === "where").length, 0);
 });
 
 test("on Windows core's refusal of --via machines is explained on Connect and Repair", async () => {
