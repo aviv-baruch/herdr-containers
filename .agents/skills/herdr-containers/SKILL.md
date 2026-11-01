@@ -104,4 +104,5 @@ mods other people made"). The app home is
 | Spaces/agents show **Disconnected** | Their container or Docker is down (swaps only); they come back when it is. |
 | Spaces group lingers after Disconnect; no Disconnected agents; no Settings → Containers | The swaps aren't installed (Install step 5). |
 | Ctrl+Shift+Y does nothing | keys.json not merged, a renamed mod still bound as `containers.toggle`, or the block id isn't `containers`. |
+| Links from a container don't open, or `localhost` links don't load | Needs this `hc-devcontainer` on core's PATH and a reconnect; `BROWSER` reaches terminals after core restarts (`hc machine update <machine>`). Forwarding needs `python3`, `bash`, or `nc` in the container. On WSL, links that fail everywhere need `wslu`. |
 | Timed out / Herdr hasn't loaded it | Click the row again; Herdr's machine list lags a few seconds. |
