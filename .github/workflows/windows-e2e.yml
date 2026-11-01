@@ -1,0 +1,64 @@
+name: windows-e2e
+
+# Throwaway: runs the Windows path on a real Windows runner. Lives only on the
+# test/windows-e2e branch; never merge it.
+on:
+  push:
+    branches: [test/windows-e2e]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.actor == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # tag=v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Tools
+        run: |
+          python --version; rustc --version; & "C:\Program Files\Git\bin\sh.exe" --version
+          Get-Command py -ErrorAction SilentlyContinue
+          Get-Content -Raw requirements\windows\hc-devcontainer.cmd | Format-Hex | Select-Object -First 2
+      - name: Helper unit tests, natively on Windows
+        continue-on-error: true
+        run: python -I -B -m unittest discover -s test -p test_hc_devcontainer.py
+      - name: App and via paths
+        run: python -I -B test/windows-e2e/e2e.py -v
+
+  core:
+    if: github.actor == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          repository: herdrdev/herdr-core
+          ref: 7a54c2975225a859b7e7d67302df5efc249fb9d0
+          path: herdr-core
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # tag=v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Patch core to accept --via on Windows
+        working-directory: herdr-core
+        run: git apply --verbose ../test/windows-e2e/herdr-core-windows-via.patch
+      - name: Build core
+        working-directory: herdr-core
+        run: cargo build -p herdr-core
+      - name: Core machines unit tests
+        working-directory: herdr-core
+        run: cargo test -p herdr-core --lib machines
+      - name: Patched core adds a container through the via
+        env:
+          HERDR_CORE_BIN: herdr-core/target/debug/herdr-core.exe
+        run: python -I -B test/windows-e2e/e2e.py -v PatchedCore
