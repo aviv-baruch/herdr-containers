@@ -14,6 +14,10 @@ import sys
 FOLDER_LABELS = ("devcontainer.local_folder", "vsch.local.folder")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 ENV_REFERENCE = re.compile(r"\$\{(containerEnv|localEnv):([^}:]+)(?::([^}]*))?\}")
+WINDOWS = os.name == "nt"
+DRIVE_PATH = re.compile(r"([A-Za-z]):(?:[\\/](.*))?\Z", re.S)
+# Docker Desktop (WSL 2, Hyper-V) and WSL spell a Windows drive inside Linux.
+DRIVE_MOUNT = re.compile(r"/(?:run/desktop/mnt/host|host_mnt|mnt)/([A-Za-z])(?:/(.*))?\Z", re.S)
 
 
 def metadata(raw):
@@ -68,8 +72,28 @@ def metadata_remote_env(raw, container_env):
     return remote
 
 
+def base_name(path):
+    # Docker Desktop labels hold Windows paths whatever the helper runs on.
+    return re.split(r"[\\/]", path.rstrip("\\/"))[-1]
+
+
+def host_parts(path):
+    """A host path as parts; a Windows drive becomes "c:" however it is spelled."""
+    if WINDOWS or not DRIVE_PATH.match(path):
+        path = os.path.realpath(path)
+    drive = DRIVE_PATH.match(path) or DRIVE_MOUNT.match(path)
+    if drive:
+        return [f"{drive[1].lower()}:", *(p for p in re.split(r"[\\/]", drive[2] or "") if p)]
+    return [p for p in re.split(r"[\\/]" if WINDOWS else "/", path) if p]
+
+
+def folded(parts):
+    # Windows paths ignore case.
+    return [p.lower() for p in parts] if WINDOWS or (parts and DRIVE_PATH.match(parts[0])) else parts
+
+
 def machine_name(folder):
-    raw = os.path.basename(folder.rstrip(os.sep))
+    raw = base_name(folder)
     ascii_lower = "".join(c.lower() if c.isascii() else "-" for c in raw)
     name = "".join(c if c.isalnum() or c in "-_." else "-"
                    for c in ascii_lower).lstrip("-_.")[:32]
@@ -108,7 +132,11 @@ def exec_container(docker, row, container_id, line):
     env = {**os.environ, **remote}
     # A remote PATH must not change where the host finds Docker.
     executable = (shutil.which(docker) or docker) if "PATH" in remote else docker
-    os.execvpe(executable, exec_argv(docker, container_id, row["user"], line, remote, row.get("workspace")), env)
+    argv = exec_argv(docker, container_id, row["user"], line, remote, row.get("workspace"))
+    if WINDOWS:
+        # Windows has no exec: os.exec* starts a child and exits at once, ending the connection.
+        return subprocess.run([executable, *argv[1:]], env=env, check=False).returncode
+    os.execvpe(executable, argv, env)
 
 
 def shell_quote(value):
@@ -116,31 +144,26 @@ def shell_quote(value):
 
 
 def same_folder(a, b):
-    return os.path.realpath(a) == os.path.realpath(b)
+    return folded(host_parts(a)) == folded(host_parts(b))
 
 
 def workspace_for(folder, mounts, working_dir, devcontainer=False, repo_folder=""):
     best = None
     if folder:
-        folder = os.path.realpath(folder)
+        parts = host_parts(folder)
+        key = folded(parts)
         for mount in mounts:
             if mount.get("Type", "bind") != "bind":
                 continue
             source, dest = mount.get("Source"), mount.get("Destination")
             if not source or not dest:
                 continue
-            source = os.path.realpath(source)
-            try:
-                if os.path.commonpath([folder, source]) != source:
-                    continue
-            except ValueError:
-                continue
-            if best is None or len(source) > len(best[0]):
-                best = (source, dest)
+            source = folded(host_parts(source))
+            if key[:len(source)] == source and (best is None or len(source) > best[0]):
+                best = (len(source), dest)
     if best:
-        source, dest = best
-        relative = os.path.relpath(folder, source)
-        return posixpath.normpath(posixpath.join(dest, relative))
+        depth, dest = best
+        return posixpath.normpath(posixpath.join(dest, *parts[depth:]))
     if devcontainer:
         dests = {posixpath.normpath(m.get("Destination") or "/") for m in mounts}
         # VS Code's Clone in Volume: the volume is /workspaces, the repo a folder in it.
@@ -150,7 +173,7 @@ def workspace_for(folder, mounts, working_dir, devcontainer=False, repo_folder="
         # image names no folder of its own, and only when unambiguous.
         found = sorted(d for d in dests if posixpath.dirname(d) == "/workspaces"
                        and (working_dir or "/") == "/")
-        named = f"/workspaces/{os.path.basename(folder.rstrip(os.sep))}" if folder else None
+        named = f"/workspaces/{base_name(folder)}" if folder else None
         if named in found:
             return named
         if len(found) == 1:
@@ -304,8 +327,7 @@ def main(argv=None):
         found = [row for row in rows(inspect(docker, [args.container])) if row["state"] == "running"]
         if not found:
             raise RuntimeError(f"container {args.container!r} is not running")
-        exec_container(docker, found[0], found[0]["name"], args.args[0])
-        return 0
+        return exec_container(docker, found[0], found[0]["name"], args.args[0]) or 0
     if len(args.args) != 2:
         parser.error("expected <folder> <line>, or --container NAME <line>")
     folder, line = args.args
@@ -317,7 +339,7 @@ def main(argv=None):
     found.sort(key=lambda row: row["created"], reverse=True)
     if len(found) > 1:
         print(f"hc-devcontainer: {len(found)} containers match; using newest {found[0]['id']}", file=sys.stderr)
-    exec_container(docker, found[0], found[0]["id"], line)
+    return exec_container(docker, found[0], found[0]["id"], line) or 0
 
 
 if __name__ == "__main__":

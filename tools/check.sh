@@ -18,6 +18,7 @@ find tools requirements test -type f -name '*.sh' -exec sh -c '
         sh -n "$file" || { printf "check: shell syntax failed: %s\n" "$file" >&2; exit 1; }
     done
 ' sh {} + || fail 'shell syntax'
+sh -n requirements/windows/hc-devcontainer || fail 'shell syntax: requirements/windows/hc-devcontainer'
 
 find . -path './.git' -prune -o -type f -name '*.json' -exec python3 -I -B -c '
 import json

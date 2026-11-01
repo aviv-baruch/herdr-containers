@@ -372,7 +372,7 @@ class ContainerTests(unittest.TestCase):
         with patch.object(helper, "inspect", return_value=[dev]), \
                 patch.object(helper, "folder_ids", return_value=["dev-id"]) as folder_ids, \
                 patch.object(helper.os, "execvpe") as execvpe:
-            self.assertIsNone(helper.main(["/home/me/My Project", "true"]))
+            self.assertEqual(helper.main(["/home/me/My Project", "true"]), 0)
         folder_ids.assert_called_once_with("docker")
         execvpe.assert_called_once_with("docker", helper.exec_argv("docker", "dev-id", "builder", "true",
                                                                    workspace="/workspaces/project"),
@@ -579,6 +579,82 @@ class ContainerTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(helper.main(["exists", via]), 2, via)
 
+
+class WindowsHostTests(unittest.TestCase):
+    """Docker Desktop labels hold Windows paths; its mounts spell the drive in Linux forms."""
+
+    def test_windows_folders_match_whatever_the_case_slashes_or_spelling(self):
+        label = r"c:\Users\Me\My Proj"
+        for same in ("C:/users/me/my proj/", r"C:\USERS\ME\MY PROJ", "/run/desktop/mnt/host/c/Users/Me/My Proj",
+                     "/host_mnt/c/Users/Me/My Proj", "/mnt/c/Users/Me/My Proj"):
+            self.assertTrue(helper.same_folder(label, same), same)
+        for other in (r"c:\Users\Me\My Proj 2", r"d:\Users\Me\My Proj", "/Users/Me/My Proj"):
+            self.assertFalse(helper.same_folder(label, other), other)
+
+    def test_workspace_from_docker_desktop_mounts_keeps_the_case(self):
+        label = r"c:\Users\Me\Proj\Sub Dir"
+        for source in ("/run/desktop/mnt/host/c/Users/Me/Proj", "/host_mnt/c/users/me/proj",
+                       "/mnt/c/Users/Me/Proj", r"C:\Users\Me\Proj"):
+            mounts = [{"Type": "bind", "Source": source, "Destination": "/workspaces/Proj"}]
+            self.assertEqual(helper.workspace_for(label, mounts, "/"), "/workspaces/Proj/Sub Dir", source)
+        mounts = [{"Type": "bind", "Source": "/run/desktop/mnt/host/d/Users/Me/Proj", "Destination": "/wrong"}]
+        self.assertEqual(helper.workspace_for(label, mounts, "/"), "")
+
+    def test_names_and_guesses_use_the_windows_folder_name(self):
+        self.assertEqual(helper.machine_name(r"c:\Users\me\My Proj" "\\"), "my-proj")
+        mounts = [{"Type": "volume", "Destination": "/workspaces/a"}, {"Type": "volume", "Destination": "/workspaces/Proj"}]
+        self.assertEqual(helper.workspace_for(r"c:\Users\me\Proj", mounts, "/", True), "/workspaces/Proj")
+
+    def test_windows_via_finds_its_container(self):
+        dev = {"Id": "dev-id", "Name": "/dev", "State": {"Status": "exited"},
+               "Config": {"Labels": {"devcontainer.local_folder": r"c:\Users\Me\Proj"}}}
+        with patch.object(helper, "inspect", return_value=[dev]), \
+                patch.object(helper, "folder_ids", return_value=["dev-id"]):
+            row = helper.rows([dev])[0]
+            self.assertEqual(row["via"], r"hc-devcontainer 'c:\Users\Me\Proj'")
+            self.assertEqual(helper.main(["exists", row["via"]]), 0)
+            self.assertEqual(helper.main(["exists", "hc-devcontainer 'C:/users/me/proj'"]), 0)
+            self.assertEqual(helper.main(["exists", r"hc-devcontainer 'c:\Users\Me\Other'"]), 1)
+
+    def test_windows_runs_docker_exec_as_a_child_and_passes_its_code(self):
+        row = {"user": "me", "workspace": "/w"}
+        with patch.object(helper, "WINDOWS", True), patch.object(helper.os, "execvpe") as execvpe, \
+                patch.object(helper.subprocess, "run", return_value=done(code=3)) as run:
+            self.assertEqual(helper.exec_container("docker", row, "id", "true"), 3)
+        execvpe.assert_not_called()
+        run.assert_called_once_with(helper.exec_argv("docker", "id", "me", "true", {}, "/w"),
+                                    env=dict(os.environ), check=False)
+
+    def test_windows_cmd_launcher_runs_the_helper_beside_it(self):
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "requirements" / "windows" / "hc-devcontainer.cmd").read_text(encoding="utf-8")
+        self.assertIn('"%~dp0hc-devcontainer.py" %*', launcher)
+        self.assertIn("exit /b", launcher)
+        self.assertNotIn("/dev/null", launcher)
+        attributes = (root / ".gitattributes").read_text(encoding="utf-8").splitlines()
+        self.assertIn("*.cmd text eol=crlf", attributes)
+        self.assertIn("requirements/windows/hc-devcontainer text eol=lf", attributes)
+
+    def test_windows_sh_launcher_passes_args_untouched_to_the_helper_beside_it(self):
+        # Core on Windows runs a via with Git for Windows' sh, which can't use the helper's python3 shebang.
+        launcher = Path(__file__).resolve().parents[1] / "requirements" / "windows" / "hc-devcontainer"
+        with tempfile.TemporaryDirectory() as temp:
+            bin_dir, fake = Path(temp) / "bin", Path(temp) / "fake"
+            bin_dir.mkdir()
+            fake.mkdir()
+            shutil.copy(launcher, bin_dir / "hc-devcontainer")
+            (bin_dir / "hc-devcontainer.py").write_text(
+                "import json, os, sys\n"
+                "print(json.dumps([sys.argv[1:], os.environ.get('MSYS_NO_PATHCONV'), os.environ.get('MSYS2_ARG_CONV_EXCL')]))\n")
+            (fake / "py").write_text(f'#!/bin/sh\n[ "$1" = -3 ] || exit 9\nshift\nexec {shlex.quote(sys.executable)} "$@"\n')
+            (fake / "py").chmod(0o755)
+            line = """sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x "$p" ] || exit 127'"""
+            via = f"{bin_dir}/hc-devcontainer 'c:\\Users\\Me\\My Proj'"
+            env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+            # Exactly how core runs a via: sh -c '<via> "$1"' sh <line>.
+            result = subprocess.run(["sh", "-c", f'{via} "$1"', "sh", line], env=env,
+                                    capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), [["c:\\Users\\Me\\My Proj", line], "1", "*"])
 
 if __name__ == "__main__":
     unittest.main()

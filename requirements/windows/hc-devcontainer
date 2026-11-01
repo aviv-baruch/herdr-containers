@@ -1,0 +1,10 @@
+#!/bin/sh
+# Core on Windows runs a via with sh from Git for Windows, which can't use the
+# helper's python3 shebang. Run hc-devcontainer.py beside this with Python 3.
+# MSYS must not rewrite the connection line's /paths for Windows programs.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+helper=$(dirname "$0")/hc-devcontainer.py
+if command -v py >/dev/null 2>&1; then
+    exec py -3 "$helper" "$@"
+fi
+exec python "$helper" "$@"

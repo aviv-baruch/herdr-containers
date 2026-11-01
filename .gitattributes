@@ -1,2 +1,4 @@
 *.sh text eol=lf
 requirements/hc-devcontainer text eol=lf
+*.cmd text eol=crlf
+requirements/windows/hc-devcontainer text eol=lf
