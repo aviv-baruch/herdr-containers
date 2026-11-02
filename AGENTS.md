@@ -50,6 +50,11 @@ only hand-written mod; its tests are in `test/test_containers.cjs`.
   The engine is VS Code's own when its `cli-bin` record exists (Electron with
   `ELECTRON_RUN_AS_NODE=1`); VS Code's `devcontainer` shim has only
   open/build and must never be run. Tests pin `HC_DEVCONTAINER_CLI=""`.
+- `serve` (the connection's background helper) bridges links, ports, git
+  credentials and the clipboard through files in the user's private
+  `~/.cache/herdr-containers` (`open`, `cred/`, `clip/`) that its listener
+  announces. Binary data (clipboard images) never goes through the listener's
+  text lines: the host fetches and answers with separate `docker exec`s.
 - Shipped Spaces caches machines for 15 s; the app polls `machine.list`
   about every 2.5 s. `space.close` only queues closure.
 - Tests and smokes use isolated `HC_SESSION` and scratch `HERDR_APP_HOME`.

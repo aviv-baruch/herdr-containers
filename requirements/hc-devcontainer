@@ -6,6 +6,7 @@ connecting go through it, so hooks, userEnvProbe and remoteEnv apply as in VS Co
 """
 
 import argparse
+import base64
 import json
 import os
 import posixpath
@@ -15,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -178,17 +180,230 @@ fi
 [ -n "$1" ] || exit 0
 """ + CREDENTIAL_CONFIG
 
-# The host's answer to request $1, from stdin; $2, if any, says why there is none.
-CREDENTIAL_ANSWER = """umask 077
-cred="$HOME/.cache/herdr-containers/cred"
-[ -d "$cred" ] || exit 0
-[ -z "${2:-}" ] || printf '%s\\n' "$2" >"$cred/$1.msg"
-cat >"$cred/$1.tmp" && mv -f "$cred/$1.tmp" "$cred/$1.res"
+def answer_script(folder):
+    """The host's answer to request $1 in `folder`, from stdin; $2, if any, says why there is none."""
+    return f"""umask 077
+d="$HOME/.cache/herdr-containers/{folder}"
+[ -d "$d" ] || exit 0
+[ -z "${{2:-}}" ] || printf '%s\\n' "$2" >"$d/$1.msg"
+cat >"$d/$1.tmp" && mv -f "$d/$1.tmp" "$d/$1.res"
+"""
+
+
+CREDENTIAL_ANSWER = answer_script("cred")
+CLIPBOARD_ANSWER = answer_script("clip")
+# A clipboard request, as is (images are binary), taken from the folder.
+CLIPBOARD_FETCH = """f="$HOME/.cache/herdr-containers/clip/$1.work"
+cat "$f" && rm -f "$f"
+"""
+
+CLIPBOARD_NAMES = ("xclip", "xsel", "wl-copy", "wl-paste", "pbcopy", "pbpaste")
+# One script under each name. Requests go to the host's clipboard through serve:
+# "types", "get TYPE" or "set TYPE" and the data, TYPE being text or image/png.
+# Without a live listener, a real tool of the same name runs, if there is one.
+CLIPBOARD_TOOL = r"""#!/bin/sh
+name=${0##*/}
+bin=$(cd "$(dirname -- "$0")" && pwd)
+dir=${bin%/*}
+real() {
+    set -f
+    old=$IFS
+    IFS=:
+    for p in $PATH; do
+        [ -n "$p" ] && [ -x "$p/$name" ] && [ "$(cd "$p" 2>/dev/null && pwd)" != "$bin" ] || continue
+        IFS=$old
+        exec "$p/$name" "$@"
+    done
+    echo "$name: no clipboard here: Herdr isn't connected to this container" >&2
+    exit 1
+}
+pid=$(cat "$dir/serve.lock/pid" 2>/dev/null) &&
+    tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q hc-devcontainer-serve || real "$@"
+
+# ask OP TYPE: the host's answer on stdout; "set" sends stdin.
+ask() {
+    umask 077
+    req="$dir/clip/$$-$(date +%s)"
+    if [ "$1" = set ]; then
+        { echo "$1 $2"; cat; } >"$req.tmp"
+    else
+        echo "$1 $2" >"$req.tmp"
+    fi && mv -f "$req.tmp" "$req.req" || {
+        rm -f "$req.tmp"
+        echo "$name: can't reach the host's clipboard" >&2
+        exit 1
+    }
+    end=$(($(date +%s) + 30))
+    while [ ! -e "$req.res" ]; do
+        [ "$(date +%s)" -lt "$end" ] || {
+            rm -f "$req.req"
+            echo "$name: no answer from the host's clipboard" >&2
+            exit 1
+        }
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    if [ -s "$req.msg" ]; then
+        printf '%s: ' "$name" >&2
+        cat "$req.msg" >&2
+        rm -f "$req.res" "$req.msg"
+        exit 1
+    fi
+    cat "$req.res"
+    rm -f "$req.res"
+}
+
+# A requested type as the host knows it: text, image/png, or nothing carried.
+kind() {
+    case $1 in
+        ''|text|text/plain|text/plain\;*|UTF8_STRING|STRING|TEXT|COMPOUND_TEXT) echo text ;;
+        image/png) echo image/png ;;
+    esac
+}
+
+get() {
+    k=$(kind "$1")
+    [ -n "$k" ] || { echo "$name: the host's clipboard has no $1" >&2; exit 1; }
+    ask get "$k"
+}
+
+put() {
+    k=$(kind "$1")
+    [ -n "$k" ] || { echo "$name: can't copy $1 to the host's clipboard" >&2; exit 1; }
+    ask set "$k"
+}
+
+types() {
+    ask types "" | while read -r t; do
+        case $t in
+            text) printf '%s\n' 'text/plain;charset=utf-8' text/plain UTF8_STRING STRING TEXT ;;
+            image/png) echo image/png ;;
+        esac
+    done
+}
+
+case $name in
+    xclip)
+        out= t= files=
+        while [ $# -gt 0 ]; do
+            case $1 in
+                -o|-out) out=1 ;;
+                -i|-in) out= ;;
+                -t|-target) shift; t=${1:-} ;;
+                -selection|-sel|-display|-d|-loops|-l) shift ;;
+                -*) ;;
+                *) files="$files$1
+" ;;
+            esac
+            shift
+        done
+        if [ -n "$out" ]; then
+            if [ "$t" = TARGETS ]; then
+                echo TARGETS
+                types
+            else
+                get "$t"
+            fi
+        elif [ -n "$files" ]; then
+            printf '%s' "$files" | while IFS= read -r f; do cat -- "$f"; done | put "$t"
+        else
+            put "$t"
+        fi
+        ;;
+    xsel)
+        mode=
+        for a do
+            case $a in
+                --output) mode=out ;;
+                --input|--append) mode=in ;;
+                --clear|--delete) mode=clear ;;
+                --*) ;;
+                -*o*) mode=out ;;
+                -*[ia]*) mode=in ;;
+                -*[cd]*) mode=clear ;;
+            esac
+        done
+        if [ -z "$mode" ]; then
+            if [ -t 0 ]; then mode=out; else mode=in; fi
+        fi
+        case $mode in
+            out) get text ;;
+            in) put text ;;
+            clear) printf '' | put text ;;
+        esac
+        ;;
+    wl-copy)
+        t= clear= text= given=
+        while [ $# -gt 0 ]; do
+            case $1 in
+                -t|--type) shift; t=${1:-} ;;
+                --type=*) t=${1#--type=} ;;
+                -c|--clear) clear=1 ;;
+                -s|--seat) shift ;;
+                --) shift; break ;;
+                -*) ;;
+                *) break ;;
+            esac
+            shift
+        done
+        if [ -n "$clear" ]; then
+            printf '' | put text
+        elif [ $# -gt 0 ]; then
+            printf '%s' "$*" | put "$t"
+        else
+            put "$t"
+        fi
+        ;;
+    wl-paste)
+        t= list= nl=1
+        while [ $# -gt 0 ]; do
+            case $1 in
+                -l|--list-types) list=1 ;;
+                -t|--type) shift; t=${1:-} ;;
+                --type=*) t=${1#--type=} ;;
+                -n|--no-newline) nl= ;;
+                -s|--seat) shift ;;
+                -w|--watch) echo "wl-paste: --watch isn't available in containers" >&2; exit 1 ;;
+                -*) ;;
+            esac
+            shift
+        done
+        if [ -n "$list" ]; then
+            types
+        elif [ "$(kind "$t")" = text ]; then
+            get "$t"
+            [ -z "$nl" ] || echo
+        else
+            get "$t"
+        fi
+        ;;
+    pbcopy) put text ;;
+    pbpaste) get text ;;
+    *) echo "$name: not a clipboard tool" >&2; exit 1 ;;
+esac
+"""
+
+# Installs the tools from stdin ($1 "on"), or removes them.
+CLIPBOARD_SETUP = """umask 077
+dir="$HOME/.cache/herdr-containers"
+mode=$1
+shift
+if [ "$mode" != on ]; then
+    rm -rf "$dir/bin"
+    exit 0
+fi
+mkdir -p "$dir/bin" && chmod 700 "$dir" || exit 1
+if ! { cat >"$dir/bin/clipboard.$$" && chmod 755 "$dir/bin/clipboard.$$" &&
+        mv -f "$dir/bin/clipboard.$$" "$dir/bin/clipboard"; }; then
+    rm -f "$dir/bin/clipboard.$$"
+    exit 1
+fi
+for name do ln -sf clipboard "$dir/bin/$name" || exit 1; done
 """
 
 # One listener per container user (hc-devcontainer-serve marks its cmdline).
 # Prints "open URL", "cred ID HEX" (a credential request, hex because it spans
-# lines) and, on change, "ports ADDR:PORT…" (hex, /proc/net/tcp*).
+# lines), "clip ID" (a clipboard request, fetched as is) and, on change,
+# "ports ADDR:PORT…" (hex, /proc/net/tcp*).
 # Exit 3: another runs; 4: no home to work in.
 LISTEN = """# hc-devcontainer-serve
 umask 077
@@ -208,8 +423,8 @@ exec 3<&0
 (cat <&3 >/dev/null; kill $$) &
 exec 3<&-
 rm -f "$dir/open"
-rm -rf "$dir/cred"
-mkdir "$dir/cred" || exit 4
+rm -rf "$dir/cred" "$dir/clip"
+mkdir "$dir/cred" "$dir/clip" || exit 4
 last=
 while :; do
     if [ -s "$dir/open" ] && mv -f "$dir/open" "$dir/open.$$" 2>/dev/null; then
@@ -223,6 +438,13 @@ while :; do
         mv -f "$req" "$dir/cred/$id.work" 2>/dev/null || continue
         echo "cred $id $(od -An -v -tx1 <"$dir/cred/$id.work" | tr -d ' \\n')" || exit 0
         rm -f "$dir/cred/$id.work"
+    done
+    for req in "$dir"/clip/*.req; do
+        [ -f "$req" ] || continue
+        id=${req##*/}
+        id=${id%.req}
+        mv -f "$req" "$dir/clip/$id.work" 2>/dev/null || continue
+        echo "clip $id" || exit 0
     done
     ports=$(awk '$4 == "0A" { print $2 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr '\\n' ' ')
     if [ "$ports" != "$last" ]; then
@@ -280,6 +502,14 @@ def listening(ports_line):
     return found
 
 
+def is_wsl():
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as stream:
+            return "microsoft" in stream.read().lower()
+    except OSError:
+        return False
+
+
 def host_opener():
     if os.environ.get("HC_DEVCONTAINER_OPEN"):
         return shlex.split(os.environ["HC_DEVCONTAINER_OPEN"])
@@ -287,12 +517,7 @@ def host_opener():
         return ["explorer.exe"]
     if sys.platform == "darwin":
         return ["open"]
-    try:
-        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as stream:
-            wsl = "microsoft" in stream.read().lower()
-    except OSError:
-        wsl = False
-    if wsl:
+    if is_wsl():
         # The Windows browser, as VS Code uses; WSL forwards localhost to it.
         found = shutil.which("wslview") or shutil.which("explorer.exe")
         if found or os.path.exists("/mnt/c/Windows/explorer.exe"):
@@ -347,6 +572,163 @@ def host_env():
                              if name in DESKTOP_VARS and isinstance(value, str) and not os.environ.get(name)}}
 
 
+PNG = b"\x89PNG\r\n\x1a\n"
+TEXT_TYPES = ("UTF8_STRING", "STRING", "TEXT")
+PS_HEAD = ("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+           "[Console]::InputEncoding=[Text.Encoding]::UTF8;Add-Type -AssemblyName System.Windows.Forms,System.Drawing;")
+PS_CLIPBOARD = {
+    ("types", ""): "if([Windows.Forms.Clipboard]::ContainsText()){'text'};if([Windows.Forms.Clipboard]::ContainsImage()){'image/png'}",
+    ("get", "text"): "[Console]::Out.Write([Windows.Forms.Clipboard]::GetText())",
+    ("get", "image/png"): "$i=[Windows.Forms.Clipboard]::GetImage();if($i){$m=New-Object IO.MemoryStream;"
+                          "$i.Save($m,[Drawing.Imaging.ImageFormat]::Png);[Console]::Out.Write([Convert]::ToBase64String($m.ToArray()))}",
+    ("set", "text"): "$t=[Console]::In.ReadToEnd();if($t.Length){[Windows.Forms.Clipboard]::SetText($t)}"
+                     "else{[Windows.Forms.Clipboard]::Clear()}",
+    ("set", "image/png"): "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd());"
+                          "[Windows.Forms.Clipboard]::SetImage([Drawing.Image]::FromStream((New-Object IO.MemoryStream(,$b))))",
+}
+
+
+def powershell():
+    if WINDOWS:
+        return "powershell"
+    return shutil.which("powershell.exe") or "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def clipboard_backend():
+    """Which clipboard this host has: WSL uses Windows' own, as VS Code does."""
+    if WINDOWS or is_wsl():
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    env = host_env()
+    if env.get("WAYLAND_DISPLAY") and shutil.which("wl-paste") and shutil.which("wl-copy"):
+        return "wayland"
+    if env.get("DISPLAY"):
+        if shutil.which("xclip"):
+            return "x11"
+        if shutil.which("xsel"):
+            return "xsel"
+    return None
+
+
+def clip_run(argv, data=None, keep=False, env=None):
+    # keep: the tool stays behind to own the clipboard (wl-copy, xclip -i), so no pipes to wait on.
+    out = subprocess.DEVNULL if keep else subprocess.PIPE
+    return subprocess.run(argv, input=data, stdout=out, stderr=out, timeout=20, check=False, env=env or host_env())
+
+
+def reason(result):
+    text = " ".join((result.stderr or b"").decode(errors="replace").split())
+    return "".join(c for c in text if c.isprintable())[:300] or f"exit {result.returncode}"
+
+
+def listed(names, text=None):
+    """types' answer from a clipboard's type names."""
+    names = [n.strip() for n in names if n.strip()]
+    text = any(n.startswith("text/plain") or n in TEXT_TYPES for n in names) if text is None else text
+    return (b"text\n" if text else b"") + (b"image/png\n" if "image/png" in names else b"")
+
+
+def missing(kind):
+    return b"", f"the host's clipboard has no {kind}"
+
+
+def wayland_clipboard(op, kind, data):
+    if op == "types":
+        return listed(clip_run(["wl-paste", "--list-types"]).stdout.decode(errors="replace").split("\n")), ""
+    if op == "get":
+        found = clip_run(["wl-paste", "--no-newline", "--type", kind])
+        return (found.stdout, "") if not found.returncode else (b"", reason(found))
+    copied = clip_run(["wl-copy", "--type", "text/plain;charset=utf-8" if kind == "text" else kind], data, keep=True)
+    return b"", "" if not copied.returncode else f"wl-copy failed (exit {copied.returncode})"
+
+
+def x11_clipboard(op, kind, data):
+    xclip = ["xclip", "-selection", "clipboard"]
+    if op == "types":
+        return listed(clip_run([*xclip, "-t", "TARGETS", "-o"]).stdout.decode(errors="replace").split("\n")), ""
+    if op == "get":
+        found = clip_run([*xclip, *([] if kind == "text" else ["-t", kind]), "-o"])
+        return (found.stdout, "") if not found.returncode else (b"", reason(found))
+    copied = clip_run([*xclip, "-t", "UTF8_STRING" if kind == "text" else kind, "-i"], data, keep=True)
+    return b"", "" if not copied.returncode else f"xclip failed (exit {copied.returncode})"
+
+
+def xsel_clipboard(op, kind, data):
+    if kind == "image/png":
+        return b"", "xsel carries only text; install xclip or wl-clipboard on the host for images"
+    if op == "set":
+        copied = clip_run(["xsel", "--clipboard", "--input"], data, keep=True)
+        return b"", "" if not copied.returncode else f"xsel failed (exit {copied.returncode})"
+    found = clip_run(["xsel", "--clipboard", "--output"])
+    if op == "types":
+        return listed([], text=bool(found.stdout)), ""
+    return (found.stdout, "") if not found.returncode else (b"", reason(found))
+
+
+def windows_clipboard(op, kind, data):
+    script = base64.b64encode((PS_HEAD + PS_CLIPBOARD[(op, kind)]).encode("utf-16-le")).decode()
+    payload = (base64.b64encode(data) if kind == "image/png" else data) if op == "set" else None
+    found = clip_run([powershell(), "-NoProfile", "-NonInteractive", "-Sta", "-EncodedCommand", script], payload)
+    if found.returncode:
+        return b"", reason(found)
+    out = found.stdout.removeprefix(b"\xef\xbb\xbf")
+    if op == "types":
+        return b"".join(t + b"\n" for t in (b"text", b"image/png") if t in out.split()), ""
+    if op == "get" and kind == "text":
+        return out.replace(b"\r\n", b"\n"), ""
+    if op == "get":
+        return (base64.b64decode(out), "") if out.strip() else missing(kind)
+    return b"", ""
+
+
+def macos_clipboard(op, kind, data):
+    env = {**host_env(), "LANG": os.environ.get("LANG") or "en_US.UTF-8"}
+    if op == "types":
+        text = clip_run(["pbpaste"], env=env).stdout
+        info = clip_run(["osascript", "-e", "clipboard info"], env=env).stdout
+        return (b"text\n" if text else b"") + (b"image/png\n" if b"PNGf" in info or b"TIFF" in info else b""), ""
+    if kind == "text":
+        found = clip_run(["pbpaste"] if op == "get" else ["pbcopy"], data if op == "set" else None, env=env)
+        return (found.stdout if op == "get" else b"", "") if not found.returncode else (b"", reason(found))
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        if op == "get":
+            lines = [f'set f to open for access (POSIX file "{path}") with write permission', "try",
+                     "set eof f to 0", "write (the clipboard as «class PNGf») to f", "end try", "close access f"]
+            clip_run(["osascript", *(part for line in lines for part in ("-e", line))], env=env)
+            with open(path, "rb") as stream:
+                png = stream.read()
+            return (png, "") if png else missing(kind)
+        with open(path, "wb") as stream:
+            stream.write(data)
+        found = clip_run(["osascript", "-e", f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'],
+                         env=env)
+        return b"", "" if not found.returncode else reason(found)
+    finally:
+        os.unlink(path)
+
+
+CLIPBOARDS = {"wayland": wayland_clipboard, "x11": x11_clipboard, "xsel": xsel_clipboard,
+              "windows": windows_clipboard, "macos": macos_clipboard}
+
+
+def host_clipboard(op, kind, data):
+    """One request on this host's clipboard: (answer, why there is none)."""
+    backend = clipboard_backend()
+    if not backend:
+        return b"", "this host has no clipboard Herdr can reach (no display, or no wl-clipboard, xclip or xsel)"
+    if op == "set" and data.startswith(PNG):
+        kind = "image/png"  # wl-copy and pbcopy are given images without a type too
+    try:
+        return CLIPBOARDS[backend](op, kind, data)
+    except subprocess.TimeoutExpired:
+        return b"", "the host's clipboard didn't answer in time"
+    except (OSError, ValueError) as error:
+        return b"", str(error)
+
+
 # Keys of git's credential protocol (key=value, a [] suffix for lists).
 CREDENTIAL_KEY = re.compile(r"[a-z_]+(?:\[\])?\Z")
 CREDENTIAL_ACTION = {"get": "fill", "store": "approve", "erase": "reject"}
@@ -381,6 +763,36 @@ class Server:
             if not installed.returncode and where == "system":
                 subprocess.run(self.exec_argv(CREDENTIAL_CONFIG, "system", GIT_CREDENTIAL, user="root"),
                                stdin=subprocess.DEVNULL, capture_output=True, check=False)
+        except OSError:
+            pass
+
+    def setup_clipboard(self):
+        """xclip, wl-paste, pbcopy and the like in the container, on this host's clipboard."""
+        on = os.environ.get("HC_DEVCONTAINER_CLIPBOARD", "1").strip().lower() not in ("0", "off", "false", "no")
+        try:
+            subprocess.run(self.exec_argv(CLIPBOARD_SETUP, "on" if on else "off", *(CLIPBOARD_NAMES if on else ())),
+                           input=CLIPBOARD_TOOL.encode() if on else b"", capture_output=True, check=False)
+        except OSError:
+            pass
+
+    def clipboard(self, request_id):
+        """Answers one clipboard request from the container's tools."""
+        if not re.fullmatch(r"[0-9]+-[0-9]+", request_id):
+            return
+        try:
+            fetched = subprocess.run(self.exec_argv(CLIPBOARD_FETCH, request_id), capture_output=True,
+                                     timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        head, _, data = fetched.stdout.partition(b"\n")
+        op, _, kind = head.decode(errors="replace").partition(" ")
+        if (op, kind) == ("types", "") or (op in ("get", "set") and kind in ("text", "image/png")):
+            answer, why = host_clipboard(op, kind, data)
+        else:
+            answer, why = b"", f"unsupported clipboard request: {head[:60].decode(errors='replace')}"
+        try:
+            subprocess.run(self.exec_argv(CLIPBOARD_ANSWER, request_id, *([why] if why else [])), input=answer,
+                           capture_output=True, check=False)
         except OSError:
             pass
 
@@ -531,6 +943,8 @@ class Server:
             kind, _, rest = line.rstrip("\n").partition(" ")
             if kind == "open":
                 self.open(rest)
+            elif kind == "clip":
+                threading.Thread(target=self.clipboard, args=(rest,), daemon=True).start()
             elif kind == "cred":
                 # A host sign-in can take a while; links and ports go on meanwhile.
                 request_id, _, encoded = rest.partition(" ")
@@ -543,6 +957,7 @@ class Server:
     def run(self):
         """Keeps one listener running until stop(), or until there is no home."""
         self.setup_credentials()
+        self.setup_clipboard()
         while self.listen_once() != 4:
             self.ports("")
             time.sleep(2)
@@ -600,6 +1015,8 @@ if [ -z "${BROWSER:-}" ] && (umask 077 && mkdir -p "$dir" && cat >"$dir/browser.
     export BROWSER="$dir/browser"
 fi
 rm -f "$dir/browser.$$" 2>/dev/null
+# xclip, wl-paste, pbcopy and the like on the host's clipboard (see serve).
+[ -z "${HOME:-}" ] || export PATH="$dir/bin:$PATH"
 unset dir
 exec sh -c "$1"
 """

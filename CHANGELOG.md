@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Clipboard in containers: while Herdr is connected, `xclip`, `xsel`,
+  `wl-copy`, `wl-paste`, `pbcopy` and `pbpaste` in the container read and
+  write the host's clipboard (text and PNG images) on Linux, WSL, Windows and
+  macOS, so Claude Code's image paste, Neovim's `"+` and scripts work there.
+  `HC_DEVCONTAINER_CLIPBOARD=0` turns them off.
 - Daily rebuild workflow opens a PR when Herdr releases.
 - Demo video (2x) and a full-window preview from neutral demo containers.
 - README: how to add Containers to a layout you already use.

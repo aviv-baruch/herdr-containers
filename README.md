@@ -209,6 +209,16 @@ Git credentials work like VS Code's too. While Herdr is connected, git in the co
 
 Sign-in windows such as Git Credential Manager's need your desktop session, and Herdr Core, which runs the bridge, may have started outside it. Each time the Herdr app lists containers, the helper records the session's `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `WSL_INTEROP` in `${XDG_STATE_HOME:-~/.local/state}/hc-devcontainer/desktop.json` (mode 600). The bridge and the link opener fill in any of those that core's environment lacks, so GCM can open its window and reach its `secretservice` store. Core's own values win. As with VS Code, any process running as that user in the container can ask for any host credential while Herdr is connected: only connect containers you trust, or set the bridge to `none`.
 
+### Clipboard
+
+Copy and paste work across the host and its containers, on Linux (X11 or Wayland), WSL, Windows and macOS:
+
+- **Pasting into a terminal** is Herdr's own: Ctrl+Shift+V or Shift+Insert (Cmd+V on macOS), and Ctrl+V on Windows. It types the host's clipboard into the container's terminal. Ctrl+V with an image on the clipboard copies the image into the container and pastes its path, for agents such as Claude Code.
+- **Copying out of a terminal** works too: selecting with Ctrl+Shift+C or Ctrl+Insert (Cmd+C), and programs that copy with the OSC 52 escape (such as tmux and Neovim), reach the host's clipboard.
+- **Programs in the container that use the clipboard themselves**, such as Claude Code's image paste, Neovim's `"+` register, `tmux` copy commands and scripts calling `pbcopy`, have no clipboard of their own. While Herdr is connected, `serve` installs `xclip`, `xsel`, `wl-copy`, `wl-paste`, `pbcopy` and `pbpaste` for the connected user, first on the connection's `PATH`, and they read and write the **host's** clipboard: text, and PNG images (screenshots).
+
+On the host, the bridge uses `wl-clipboard` on Wayland, else `xclip` or `xsel` on X11 (with the desktop session recorded above), PowerShell on the Windows clipboard on Windows and from WSL, and `pbcopy`/`pbpaste` and AppleScript on macOS. Requests pass through the user's private `~/.cache/herdr-containers/clip`. Without a connection, each tool runs a real one of the same name if the container has one, or says that Herdr isn't connected. Like the credential bridge, this lets any process running as that user in the container read and set your host clipboard while Herdr is connected. Set `HC_DEVCONTAINER_CLIPBOARD=0` in core's environment, then restart core, to turn the tools off. A core that was already running gets them on `PATH` when it restarts (`hc machine update <machine>`).
+
 ## For agents
 
 Read [AGENTS.md](AGENTS.md). Task skills are in [`.agents/skills`](.agents/skills); `.claude/skills` points there.
