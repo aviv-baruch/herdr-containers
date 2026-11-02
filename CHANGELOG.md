@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Clones rebuilt for Herdr 0.1.12.
 - Dev containers start and connect the way VS Code opens them, through the
   Dev Containers CLI when `devcontainer` is on PATH: `initializeCommand`,
   lifecycle commands split by `waitFor` as VS Code does, dotfiles and Git
@@ -22,7 +23,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   VS Code's user settings switch them. The engine is VS Code's own bundled
   copy when VS Code is installed, else `@devcontainers/cli`. Plain containers attach through the
   CLI too. Without the CLI, and on Windows, the helper keeps `docker exec`.
-- Clones rebuilt for Herdr 0.1.10.
 - Published as a herdr.dev mod with topic `herdr-mod`; removed the
   `main-containers` layout.
 - Ctrl+Shift+Y is now a global binding.
