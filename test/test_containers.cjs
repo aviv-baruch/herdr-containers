@@ -195,6 +195,19 @@ test("only inactive container rows and their x buttons hover", () => {
   assert.equal(find(a.view.render(), "container-dev-id").hovered, false);
 });
 
+test("a long name truncates instead of running under Stopped and Start", () => {
+  const a = app();
+  const name = "datadog-agent-devcontainer-with-a-long-name";
+  a.view.rows = [{ id: "dev-id", name, kind: "devcontainer", state: "exited", folder: "/src/dev", via: "via" }];
+  const row = find(a.view.render(), "container-dev-id");
+  const holder = (node) => node?.kids?.includes(name) ? node : (node?.kids ?? []).map(holder).find(Boolean);
+  const calls = holder(row).calls.map(([call, ...args]) => [call, args]);
+  assert.ok(!calls.some(([call]) => call === "flex_none"), "a name that can't shrink overflows the row");
+  assert.deepEqual(calls.find(([call]) => call === "min_w"), ["min_w", [0]]);
+  assert.ok(calls.some(([call]) => call === "truncate"));
+  assert.deepEqual(labels(row).slice(-2), ["Stopped", "Start"]);
+});
+
 test("group headers match the Agents group header; the section title has no count", () => {
   const a = app();
   a.view.rows = [{ id: "dev-id", name: "dev", kind: "devcontainer", state: "running", via: "via" }];
