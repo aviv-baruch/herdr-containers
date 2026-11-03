@@ -387,7 +387,7 @@ export default class Containers extends View {
             (el) => el.tooltip("Rebuilds need Repair - add the herdr-core Feature"))
           .child(svg(icon(row.kind === "devcontainer" ? "folder" : "server")).size(compact ? 12 : 18).text_color(t.muted)))
         .when(!compact, (el) => el.child(h_flex().flex_1().min_w(0).gap(5).items_center()
-          .child(div().flex_none().max_w(150).truncate().text_color(stopped || disconnected || state === "disconnecting" ? t.dim : t.foreground).child(row.name))
+          .child(div().min_w(0).max_w(150).truncate().text_color(stopped || disconnected || state === "disconnecting" ? t.dim : t.foreground).child(row.name))
           .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(detail || row.kind))))
         .when(!compact && (paused || stopped), (el) => el.child(div().text_size(10.5).text_color(paused ? t.blocked : t.dim)
           .child(paused ? "Paused" : "Stopped")))
