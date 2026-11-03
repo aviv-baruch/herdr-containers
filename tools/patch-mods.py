@@ -27,8 +27,8 @@ def spaces(source):
                   '    const down = new Set(shared("containers.down") ?? []);\n'
                   '    const rows = this.ordered().filter(r => !removing.has(r.w.machine));\n')
     source = once(source,
-                  '    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name)])].sort();\n',
-                  '    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name)])].filter(m => !removing.has(m)).sort();\n')
+                  '    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();\n',
+                  '    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].filter(m => !removing.has(m)).sort();\n')
     source = once(source, '      const connected = !m || machine?.state === "connected";\n',
                   '      const connected = !down.has(m) && (!m || machine?.state === "connected");\n')
     source = once(source, '(machine?.state ?? "asleep").replace(/_/g, " ")',
@@ -74,11 +74,11 @@ def agents(source):
                   '      const sts = disconnected(a) ? [] : subs.map((s) => kidStatus(s.t, this.listed));\n')
     source = once(source, '    const rankOf = (a) => urgency.get(a.address);\n',
                   '    const rankOf = (a) => disconnected(a) ? 0 : urgency.get(a.address);\n')
-    source = once(source, '    const rest = list.filter((a) => !this.pins.includes(a.address));\n',
-                  '    const rest = list.filter((a) => !this.pins.includes(a.address) && !disconnected(a));\n'
+    source = once(source, '    const rest = list.filter((a) => !a.pinned);\n',
+                  '    const rest = list.filter((a) => !a.pinned && !disconnected(a));\n'
                   '    const away = list.filter(disconnected);\n')
-    source = once(source, '    const pinned = this.pins.map((p) => list.find((a) => a.address === p)).filter(Boolean);\n',
-                  '    const pinned = this.pins.map((p) => list.find((a) => a.address === p && !disconnected(a))).filter(Boolean);\n')
+    source = once(source, '    const pinned = list.filter((a) => a.pinned);\n',
+                  '    const pinned = list.filter((a) => a.pinned && !disconnected(a));\n')
     source = once(source, '    list = [...pinned, ...rest];\n',
                   '    list = [...pinned, ...rest, ...away];\n')
     source = once(source, '      const pic = icon(a.program, 16, t.foreground);\n',
@@ -98,8 +98,8 @@ def agents(source):
 def settings(source):
     source = once(source, 'const I = (name) => `frame/settings/${name}.svg`;',
                   'const I = (name) => `mods/settings-containers/${name}.svg`;')
-    source = once(source, 'props, closeOverlay } from "herdr";',
-                  'props, closeOverlay, setShared } from "herdr";')
+    source = once(source, 'props, closeOverlay, window } from "herdr";',
+                  'props, closeOverlay, window, setShared } from "herdr";')
     source = once(source, '  { id: "machines", title: "Machines", icon: "server" },\n',
                   '  { id: "machines", title: "Machines", icon: "server" },\n'
                   '  { id: "containers", title: "Containers", icon: "server" },\n')

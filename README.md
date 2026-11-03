@@ -15,7 +15,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 
 ## Requirements
 
-- Herdr app 0.1.10 and its core (`hc`). The four cloned mods track this version.
+- Herdr app 0.1.12 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
 - Recommended, so dev containers open exactly as in VS Code: VS Code with its Dev Containers extension on this host (the helper runs the extension's own engine with VS Code's Electron; nothing else to install), or the [Dev Containers CLI](https://github.com/devcontainers/cli) (`npm install -g @devcontainers/cli`, which needs Node.js) on the PATH seen by both app and core. Without either, the helper uses plain `docker exec`. See [VS Code parity](#vs-code-parity).
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
@@ -98,7 +98,7 @@ In shipped `main`, those three blocks become:
 ]
 ```
 
-Edit the existing blocks in place; their positions do not change. The footer opens the installed `settings-containers` mod. Keep its `"props": { "footer": true }`. Without the swaps, the shipped Spaces group can linger for 15 s after disconnect, unreachable spaces do not dim, Agents has no Disconnected group, and footer Settings has no Containers switches; both visibility options stay on. The swaps are copies of Herdr app 0.1.10's shipped mods, so compare before replacing an older or customized version. They need rebuilding and reinstalling to receive fixes from later Herdr releases.
+Edit the existing blocks in place; their positions do not change. The footer opens the installed `settings-containers` mod. Keep its `"props": { "footer": true }`. Without the swaps, the shipped Spaces group can linger for 15 s after disconnect, unreachable spaces do not dim, Agents has no Disconnected group, and footer Settings has no Containers switches; both visibility options stay on. The swaps are copies of Herdr app 0.1.12's shipped mods, so compare before replacing an older or customized version. They need rebuilding and reinstalling to receive fixes from later Herdr releases.
 
 Check each installed mod and the app status. Herdr reloads layout edits live; no layout switch is needed. `herdr-app check` needs a display.
 
@@ -208,6 +208,16 @@ Links work like VS Code's. While Herdr is connected, the container's `BROWSER` p
 Git credentials work like VS Code's too. While Herdr is connected, git in the container asks the host's git for credentials: a helper is added to the container's git config (`credential.helper` in `--global`, or `--system` with `dev.containers.gitCredentialHelperConfigLocation: "system"`; `"none"` turns the bridge off, as in VS Code). The helper hands each request to `serve`, which runs `git credential fill`, `approve` or `reject` on the host with your own helpers (keychain, Git Credential Manager, `store`, …) and returns the answer. So `git push` over HTTPS uses your host sign-in, and credentials typed in the container are saved on the host. Requests and answers pass through the connected user's private `~/.cache/herdr-containers/cred` (mode 700). Without a connection the helper answers nothing, so git falls back to its own prompt. When the host can't answer, git in the container prints why (`herdr-containers: the host's git could not answer: …`).
 
 Sign-in windows such as Git Credential Manager's need your desktop session, and Herdr Core, which runs the bridge, may have started outside it. Each time the Herdr app lists containers, the helper records the session's `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `WSL_INTEROP` in `${XDG_STATE_HOME:-~/.local/state}/hc-devcontainer/desktop.json` (mode 600). The bridge and the link opener fill in any of those that core's environment lacks, so GCM can open its window and reach its `secretservice` store. Core's own values win. As with VS Code, any process running as that user in the container can ask for any host credential while Herdr is connected: only connect containers you trust, or set the bridge to `none`.
+
+### Clipboard
+
+Copy and paste work across the host and its containers, on Linux (X11 or Wayland), WSL, Windows and macOS:
+
+- **Pasting into a terminal** is Herdr's own: Ctrl+Shift+V or Shift+Insert (Cmd+V on macOS), and Ctrl+V on Windows. It types the host's clipboard into the container's terminal. Ctrl+V with an image on the clipboard copies the image into the container and pastes its path, for agents such as Claude Code.
+- **Copying out of a terminal** works too: selecting with Ctrl+Shift+C or Ctrl+Insert (Cmd+C), and programs that copy with the OSC 52 escape (such as tmux and Neovim), reach the host's clipboard.
+- **Programs in the container that use the clipboard themselves**, such as Claude Code's image paste, Neovim's `"+` register, `tmux` copy commands and scripts calling `pbcopy`, have no clipboard of their own. While Herdr is connected, `serve` installs `xclip`, `xsel`, `wl-copy`, `wl-paste`, `pbcopy` and `pbpaste` for the connected user, first on the connection's `PATH`, and they read and write the **host's** clipboard: text, and PNG images (screenshots).
+
+On the host, the bridge uses `wl-clipboard` on Wayland, else `xclip` or `xsel` on X11 (with the desktop session recorded above), PowerShell on the Windows clipboard on Windows and from WSL, and `pbcopy`/`pbpaste` and AppleScript on macOS. Requests pass through the user's private `~/.cache/herdr-containers/clip`. Without a connection, each tool runs a real one of the same name if the container has one, or says that Herdr isn't connected. Like the credential bridge, this lets any process running as that user in the container read and set your host clipboard while Herdr is connected. Set `HC_DEVCONTAINER_CLIPBOARD=0` in core's environment, then restart core, to turn the tools off. A core that was already running gets them on `PATH` when it restarts (`hc machine update <machine>`).
 
 ## For agents
 

@@ -1232,7 +1232,7 @@ class BrowserTests(unittest.TestCase):
         listener = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     text=True)
         with patch.object(helper.subprocess, "Popen", return_value=listener) as popen, \
-                patch.object(server, "setup_credentials"):
+                patch.object(server, "setup_credentials"), patch.object(server, "setup_clipboard"):
             thread = threading.Thread(target=server.run, daemon=True)
             thread.start()
             for _ in range(50):
@@ -1516,6 +1516,301 @@ class CredentialTests(unittest.TestCase):
                     thread.join(5)
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertIn("username=me\npassword=tok\n", got.stdout)
+
+
+class FakeHost:
+    """serve's side of the clipboard folder, answering with handle(op, kind, data) -> (answer, why)."""
+
+    def __init__(self, home, handle):
+        self.home, self.handle, self.seen = home, handle, []
+        self.folder = Path(home) / ".cache" / "herdr-containers"
+        (self.folder / "clip").mkdir(parents=True, exist_ok=True)
+        self.stop = False
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def loop(self):
+        while not self.stop:
+            for request in (self.folder / "clip").glob("*.req"):
+                raw = request.read_bytes()
+                request.unlink()
+                head, _, data = raw.partition(b"\n")
+                op, _, kind = head.decode().partition(" ")
+                self.seen.append((op, kind, data))
+                answer, why = self.handle(op, kind, data)
+                subprocess.run(["/bin/sh", "-c", helper.CLIPBOARD_ANSWER, "sh", request.stem, *([why] if why else [])],
+                               env={**os.environ, "HOME": self.home}, input=answer, check=True)
+            time.sleep(0.02)
+
+    def close(self):
+        self.stop = True
+        self.thread.join(5)
+
+
+class ClipboardTests(unittest.TestCase):
+    """Clipboard tools in the container read and write the host's clipboard, through serve."""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.home = temp.name
+        self.listener, folder = fake_listener(self.home)
+        self.addCleanup(lambda: (self.listener.kill(), self.listener.wait()))
+        self.bin = folder / "bin"
+        self.bin.mkdir()
+        (self.bin / "clipboard").write_text(helper.CLIPBOARD_TOOL)
+        (self.bin / "clipboard").chmod(0o755)
+        for name in helper.CLIPBOARD_NAMES:
+            (self.bin / name).symlink_to("clipboard")
+        self.clip = {"text": b"from the host\n", "image/png": self.PNG}
+
+        def handle(op, kind, data):
+            if op == "types":
+                return "".join(f"{k}\n" for k in self.clip).encode(), ""
+            if op == "get":
+                return (self.clip[kind], "") if kind in self.clip else (b"", f"the host's clipboard has no {kind}")
+            self.clip = {kind: data}
+            return b"", ""
+
+        self.host = FakeHost(self.home, handle)
+        self.addCleanup(self.host.close)
+
+    def tool(self, *argv, data=None, tty=False):
+        env = {**os.environ, "HOME": self.home, "PATH": f"{self.bin}:/usr/bin:/bin"}
+        return subprocess.run([str(self.bin / argv[0]), *argv[1:]], input=data, capture_output=True,
+                              timeout=15, check=False, env=env)
+
+    def test_xclip_as_claude_code_and_editors_use_it(self):
+        targets = self.tool("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o")
+        self.assertEqual(targets.returncode, 0, targets.stderr)
+        self.assertEqual(targets.stdout.decode().split("\n")[0], "TARGETS")
+        self.assertIn("image/png", targets.stdout.decode().split())
+        self.assertIn("UTF8_STRING", targets.stdout.decode().split())
+        image = self.tool("xclip", "-selection", "clipboard", "-t", "image/png", "-o")
+        self.assertEqual(image.stdout, self.PNG)
+        self.assertEqual(self.tool("xclip", "-o").stdout, b"from the host\n")
+        self.assertEqual(self.tool("xclip", "-sel", "c", "-o", "-t", "UTF8_STRING").stdout, b"from the host\n")
+        self.assertEqual(self.tool("xclip", "-selection", "clipboard", data=b"copied\n").returncode, 0)
+        self.assertEqual(self.clip, {"text": b"copied\n"})
+        with tempfile.NamedTemporaryFile(dir=self.home) as f:
+            f.write(b"from a file")
+            f.flush()
+            self.tool("xclip", "-i", "-selection", "clipboard", f.name)
+        self.assertEqual(self.clip, {"text": b"from a file"})
+        missing = self.tool("xclip", "-selection", "clipboard", "-t", "image/png", "-o")
+        self.assertEqual(missing.returncode, 1)
+        self.assertEqual(missing.stderr, b"xclip: the host's clipboard has no image/png\n")
+
+    def test_xsel_wl_clipboard_and_pb_tools(self):
+        self.assertEqual(self.tool("xsel", "-bo").stdout, b"from the host\n")
+        self.assertEqual(self.tool("xsel", "--clipboard", "--output").stdout, b"from the host\n")
+        self.tool("xsel", "-bi", data=b"a")
+        self.assertEqual(self.clip, {"text": b"a"})
+        self.tool("xsel", "--clipboard", data=b"piped")  # no -i or -o: stdin isn't a terminal
+        self.assertEqual(self.clip, {"text": b"piped"})
+        self.tool("xsel", "-bc")
+        self.assertEqual(self.clip, {"text": b""})
+        self.tool("wl-copy", "hello", "world")
+        self.assertEqual(self.clip, {"text": b"hello world"})
+        self.assertEqual(self.tool("wl-paste").stdout, b"hello world\n")
+        self.assertEqual(self.tool("wl-paste", "-n").stdout, b"hello world")
+        self.tool("wl-copy", "--type", "image/png", data=self.PNG)
+        self.assertEqual(self.clip, {"image/png": self.PNG})
+        self.assertEqual(self.tool("wl-paste", "--list-types").stdout, b"image/png\n")
+        self.assertEqual(self.tool("wl-paste", "-t", "image/png").stdout, self.PNG)
+        self.tool("pbcopy", data=b"mac \xe2\x9c\x93")
+        self.assertEqual(self.tool("pbpaste").stdout, b"mac \xe2\x9c\x93")
+        self.assertEqual(self.tool("wl-paste", "--watch", "cat").returncode, 1)
+
+    def test_without_a_connection_a_real_tool_runs_or_it_says_why(self):
+        self.listener.kill()
+        self.listener.wait()
+        got = self.tool("pbpaste")
+        self.assertEqual((got.returncode, got.stdout), (1, b""))
+        self.assertIn(b"Herdr isn't connected", got.stderr)
+        real = Path(self.home) / "real"
+        real.mkdir()
+        (real / "xclip").write_text('#!/bin/sh\necho "real xclip $*"\n')
+        (real / "xclip").chmod(0o755)
+        env = {**os.environ, "HOME": self.home, "PATH": f"{self.bin}:{real}:/usr/bin:/bin"}
+        got = subprocess.run([str(self.bin / "xclip"), "-o"], env=env, capture_output=True, timeout=5, check=False)
+        self.assertEqual(got.stdout, b"real xclip -o\n")
+        self.assertEqual(self.host.seen, [])
+
+    def test_listener_hands_over_clipboard_requests(self):
+        with tempfile.TemporaryDirectory() as home:
+            folder = Path(home) / ".cache" / "herdr-containers"
+            proc = subprocess.Popen(["/bin/sh", "-c", helper.LISTEN], env={**os.environ, "HOME": home},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(proc.stdout.readline().startswith("ports "))
+                (folder / "clip" / "5-6.req").write_bytes(b"set text\n" + self.PNG)
+                self.assertEqual(proc.stdout.readline(), "clip 5-6\n")
+                self.assertEqual((folder / "clip" / "5-6.work").read_bytes(), b"set text\n" + self.PNG)
+                fetched = subprocess.run(["/bin/sh", "-c", helper.CLIPBOARD_FETCH, "sh", "5-6"],
+                                         env={**os.environ, "HOME": home}, capture_output=True, check=False)
+                self.assertEqual(fetched.stdout, b"set text\n" + self.PNG)  # binary, as is
+                self.assertFalse((folder / "clip" / "5-6.work").exists())
+            finally:
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+                proc.stdin.close()
+
+    def test_server_fetches_does_and_answers(self):
+        server = helper.Server("docker", "abc", "dev")
+        fetched = done(b"get image/png\n")
+        with patch.object(helper.subprocess, "run", side_effect=[fetched, done()]) as run, \
+                patch.object(helper, "host_clipboard", return_value=(self.PNG, "")) as host:
+            server.clipboard("5-6")
+        host.assert_called_once_with("get", "image/png", b"")
+        self.assertEqual(run.call_args_list[0].args[0], server.exec_argv(helper.CLIPBOARD_FETCH, "5-6"))
+        self.assertEqual(run.call_args_list[1].args[0], server.exec_argv(helper.CLIPBOARD_ANSWER, "5-6"))
+        self.assertEqual(run.call_args_list[1].kwargs["input"], self.PNG)
+        with patch.object(helper.subprocess, "run", side_effect=[done(b"set text\nhi"), done()]) as run, \
+                patch.object(helper, "host_clipboard", return_value=(b"", "no display")) as host:
+            server.clipboard("5-6")
+        host.assert_called_once_with("set", "text", b"hi")
+        self.assertEqual(run.call_args_list[1].args[0], server.exec_argv(helper.CLIPBOARD_ANSWER, "5-6", "no display"))
+        for request_id, raw in (("../x", b"get text\n"), ("5-6", b"eval text\n"), ("5-6", b"get image/gif\n")):
+            with patch.object(helper.subprocess, "run", side_effect=[done(raw), done()]) as run, \
+                    patch.object(helper, "host_clipboard") as host:
+                server.clipboard(request_id)
+            host.assert_not_called()
+
+    def test_host_backends(self):
+        def calls(backend, op, kind, data=b"", outputs=()):
+            results = iter(outputs)
+            with patch.object(helper, "clipboard_backend", return_value=backend), \
+                    patch.object(helper.subprocess, "run", side_effect=lambda *a, **k: next(results, done(b"", stderr=b""))) as run:
+                got = helper.host_clipboard(op, kind, data)
+            return got, [c.args[0] for c in run.call_args_list], [c.kwargs for c in run.call_args_list]
+
+        got, argv, _ = calls("wayland", "types", "", outputs=[done(b"text/plain;charset=utf-8\nimage/png\nUTF8_STRING\n")])
+        self.assertEqual(got, (b"text\nimage/png\n", ""))
+        self.assertEqual(argv, [["wl-paste", "--list-types"]])
+        got, argv, _ = calls("wayland", "get", "image/png", outputs=[done(self.PNG)])
+        self.assertEqual((got, argv), ((self.PNG, ""), [["wl-paste", "--no-newline", "--type", "image/png"]]))
+        _, argv, kw = calls("wayland", "set", "text", b"hi")
+        self.assertEqual(argv, [["wl-copy", "--type", "text/plain;charset=utf-8"]])
+        self.assertEqual(kw[0]["stdout"], helper.subprocess.DEVNULL)  # wl-copy stays to serve it
+        got, argv, _ = calls("x11", "types", "", outputs=[done(b"TARGETS\nUTF8_STRING\nimage/png\n")])
+        self.assertEqual(got, (b"text\nimage/png\n", ""))
+        self.assertEqual(argv, [["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"]])
+        _, argv, _ = calls("x11", "set", "text", self.PNG)  # PNG bytes are an image whatever the tool said
+        self.assertEqual(argv, [["xclip", "-selection", "clipboard", "-t", "image/png", "-i"]])
+        got, argv, _ = calls("x11", "get", "text", outputs=[done(code=1, stderr=b"Error: target UTF8_STRING not available\n")])
+        self.assertEqual(got, (b"", "Error: target UTF8_STRING not available"))
+        # Windows, natively or from WSL: PowerShell on the Windows clipboard.
+        got, argv, _ = calls("windows", "get", "text", outputs=[done("café\r\nline\r\n".encode())])
+        self.assertEqual(got, ("café\nline\n".encode(), ""))
+        self.assertEqual(argv[0][:5], [helper.powershell(), "-NoProfile", "-NonInteractive", "-Sta", "-EncodedCommand"])
+        got, _, _ = calls("windows", "get", "image/png", outputs=[done(__import__("base64").b64encode(self.PNG))])
+        self.assertEqual(got, (self.PNG, ""))
+        got, _, _ = calls("windows", "get", "image/png", outputs=[done(b"")])
+        self.assertEqual(got, (b"", "the host's clipboard has no image/png"))
+        _, _, kw = calls("windows", "set", "image/png", self.PNG)
+        self.assertEqual(kw[0]["input"], __import__("base64").b64encode(self.PNG))
+        _, argv, _ = calls("macos", "get", "text", outputs=[done(b"x")])
+        self.assertEqual(argv, [["pbpaste"]])
+        _, argv, _ = calls("macos", "set", "text", b"x")
+        self.assertEqual(argv, [["pbcopy"]])
+        got, argv, _ = calls("macos", "types", "", outputs=[done(b"x"), done(b"\xc2\xabclass PNGf\xc2\xbb, 1234")])
+        self.assertEqual(got, (b"text\nimage/png\n", ""))
+        with patch.object(helper, "clipboard_backend", return_value=None):
+            self.assertIn("no clipboard", helper.host_clipboard("get", "text", b"")[1])
+
+    def test_backend_follows_the_host(self):
+        def backend(platform="linux", wsl=False, env=None, tools=("wl-paste", "wl-copy", "xclip")):
+            with patch.object(helper.sys, "platform", platform), patch.object(helper, "is_wsl", return_value=wsl), \
+                    patch.object(helper, "host_env", return_value=env or {}), \
+                    patch.object(helper.shutil, "which", side_effect=lambda t: f"/usr/bin/{t}" if t in tools else None):
+                return helper.clipboard_backend()
+        self.assertEqual(backend("darwin"), "macos")
+        self.assertEqual(backend(wsl=True), "windows")
+        self.assertEqual(backend(env={"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}), "wayland")
+        self.assertEqual(backend(env={"DISPLAY": ":0"}), "x11")
+        self.assertEqual(backend(env={"DISPLAY": ":0"}, tools=("xsel",)), "xsel")
+        self.assertIsNone(backend(env={}))
+        with patch.object(helper, "WINDOWS", True):
+            self.assertEqual(backend(), "windows")
+
+    def test_setup_installs_the_tools_and_the_connection_finds_them_first(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home}
+            result = run_script(helper.CLIPBOARD_SETUP, "on", *helper.CLIPBOARD_NAMES, env=env, input=helper.CLIPBOARD_TOOL)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bin_dir = Path(home) / ".cache" / "herdr-containers" / "bin"
+            self.assertEqual((bin_dir / "clipboard").read_text(), helper.CLIPBOARD_TOOL)
+            for name in helper.CLIPBOARD_NAMES:
+                self.assertEqual(os.readlink(bin_dir / name), "clipboard")
+            argv = helper.exec_argv("docker", "abc", None, 'printf "%s" "$PATH"')
+            got = subprocess.run(["/bin/sh", "-c", *argv[argv.index("-c") + 1:]], env={**env, "SHELL": "/bin/sh"},
+                                 capture_output=True, text=True, check=False)
+            self.assertTrue(got.stdout.startswith(f"{bin_dir}:"), got.stdout)
+            # Turned off, the tools go away.
+            run_script(helper.CLIPBOARD_SETUP, "off", env=env, input="")
+            self.assertFalse(bin_dir.exists())
+
+    def test_serve_setup_honors_the_switch(self):
+        server = helper.Server("docker", "abc", "dev")
+        for value, mode in ((None, "on"), ("0", "off"), ("off", "off"), ("1", "on")):
+            env = {} if value is None else {"HC_DEVCONTAINER_CLIPBOARD": value}
+            with self.subTest(value=value), patch.dict(os.environ, env), \
+                    patch.object(helper.subprocess, "run", return_value=done()) as run:
+                if value is None:
+                    os.environ.pop("HC_DEVCONTAINER_CLIPBOARD", None)
+                server.setup_clipboard()
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("-c") + 3], mode)
+
+
+@unittest.skipUnless(shutil.which("Xvfb") and shutil.which("xclip"), "needs Xvfb and xclip")
+class ClipboardX11EndToEnd(unittest.TestCase):
+    def test_container_tools_use_the_hosts_x11_clipboard(self):
+        with tempfile.TemporaryDirectory() as temp:
+            display = ":%d" % (90 + os.getpid() % 9)
+            xvfb = subprocess.Popen(["Xvfb", display, "-nolisten", "tcp"], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            self.addCleanup(lambda: (xvfb.kill(), xvfb.wait()))
+            time.sleep(0.5)
+            container_home = Path(temp) / "container"
+            container_home.mkdir()
+            docker = Path(temp) / "docker"
+            docker.write_text('#!/bin/sh\nshift\nwhile :; do case "$1" in -i) shift ;; -u) shift 2 ;; *) break ;; esac; done\n'
+                              f'shift\nHOME={shlex.quote(str(container_home))} exec env -u DISPLAY "$@"\n')
+            docker.chmod(0o755)
+            png = ClipboardTests.PNG
+            subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i"], input=png,
+                           env={**os.environ, "DISPLAY": display}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            server = helper.Server(str(docker), "abc", None)
+            with patch.dict(os.environ, {"DISPLAY": display}), patch.object(server, "ports"), \
+                    patch.object(server, "setup_credentials"):
+                os.environ.pop("WAYLAND_DISPLAY", None)
+                thread = threading.Thread(target=server.run, daemon=True)
+                thread.start()
+                try:
+                    bin_dir = container_home / ".cache" / "herdr-containers" / "bin"
+                    for _ in range(100):
+                        if (bin_dir / "xclip").exists() and (bin_dir.parent / "clip").exists():
+                            break
+                        time.sleep(0.05)
+                    env = {"HOME": str(container_home), "PATH": f"{bin_dir}:/usr/bin:/bin"}
+                    targets = subprocess.run(["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"], env=env,
+                                             capture_output=True, timeout=15, check=False)
+                    image = subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-o"], env=env,
+                                           capture_output=True, timeout=15, check=False)
+                    subprocess.run(["pbcopy"], input="from the container ✓".encode(), env=env, timeout=15, check=True)
+                    host = subprocess.run(["xclip", "-selection", "clipboard", "-o"], env={**os.environ, "DISPLAY": display},
+                                          capture_output=True, timeout=5, check=False)
+                finally:
+                    server.stop()
+                    thread.join(5)
+        self.assertIn(b"image/png", targets.stdout.split())
+        self.assertEqual(image.stdout, png)
+        self.assertEqual(host.stdout, "from the container ✓".encode())
 
 
 if __name__ == "__main__":
