@@ -16,7 +16,7 @@ With the recommended swaps, Agents adds **Disconnected** after its usual groups,
 
 ## How it behaves
 
-Click a running dev container to connect and open or select its workspace space. A plain container asks for **Connect** or **Cancel** inline and explains that connecting copies Herdr Core into it. A paused row asks you to unpause it; a stopped dev container offers **Start**. An unreachable saved connection can offer **Repair**, which creates a spare connection before replacing the old one. Connection, start, repair, disconnect, and forget show progress or an error. Herdr 0.1.12's Spaces also shows **rebuilt · Connect** on a machine whose core changed (for example a container rebuilt with the Feature); it re-adds the machine without installing a core, while Containers' **Repair** installs one when the container has none.
+Click a running dev container to connect and open or select its workspace space. A plain container asks for **Connect** or **Cancel** inline and explains that connecting copies Herdr Core into it. A paused row asks you to unpause it; a stopped dev container offers **Start**. An unreachable saved connection can offer **Repair**, which creates a spare connection before replacing the old one. Connection, start, repair, disconnect, and forget show progress or an error. Herdr 0.1.13's Spaces also shows **rebuilt · Connect** on a machine whose core changed (for example a container rebuilt with the Feature); it re-adds the machine without installing a core, while Containers' **Repair** installs one when the container has none.
 
 Click a saved row's **×**, then **Disconnect** to close its spaces and remove its machine connection while leaving the container running. The Spaces machine group disappears immediately with the Spaces swap; a removal error restores the row. **Forget** closes spaces and removes a saved machine whose container is gone. When Docker is down, Containers says “Docker isn't running” and saved machines say **Disconnected**. The swaps dim disconnected Spaces rows and machine groups and move their agents to Disconnected.
 
@@ -30,7 +30,7 @@ As in VS Code, a connected container's links open on the host: `BROWSER` hands h
 
 ## Built from
 
-One folder, `herdr-containers/`, contains five `mods/<name>/` folders and `keys.json`. It has no `layouts/` folder. The four `*-containers` mods are patched copies of Herdr app 0.1.12's shipped mods, built by `tools/patch-mods.py` and `tools/build-package.py`.
+One folder, `herdr-containers/`, contains five `mods/<name>/` folders and `keys.json`. It has no `layouts/` folder. The four `*-containers` mods are patched copies of Herdr app 0.1.13's shipped mods, built by `tools/patch-mods.py` and `tools/build-package.py`.
 
 | Mod | Role |
 | --- | --- |
