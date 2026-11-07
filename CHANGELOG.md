@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Clones rebuilt for Herdr 0.1.13.
 - Clones rebuilt for Herdr 0.1.12.
 - Dev containers start and connect the way VS Code opens them, through the
   Dev Containers CLI when `devcontainer` is on PATH: `initializeCommand`,
