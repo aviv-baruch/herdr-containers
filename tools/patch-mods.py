@@ -9,11 +9,15 @@ import sys
 import tempfile
 
 
-def once(source, old, new):
+def each(source, old, new, n):
     count = source.count(old)
-    if count != 1:
+    if count != n:
         raise ValueError(f"patch anchor matched {count} times: {old[:70]!r}")
-    return source.replace(old, new, 1)
+    return source.replace(old, new, n)
+
+
+def once(source, old, new):
+    return each(source, old, new, 1)
 
 
 def spaces(source):
@@ -31,8 +35,8 @@ def spaces(source):
                   '    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].filter(m => !removing.has(m)).sort();\n')
     source = once(source, '      const connected = !m || machine?.state === "connected";\n',
                   '      const connected = !down.has(m) && (!m || machine?.state === "connected");\n')
-    source = once(source, '(machine?.state ?? "asleep").replace(/_/g, " ")',
-                  '(down.has(m) ? "disconnected" : machine?.state ?? "asleep").replace(/_/g, " ")')
+    source = each(source, '(machine?.state ?? "asleep").replace(/_/g, " ")',
+                  '(down.has(m) ? "disconnected" : machine?.state ?? "asleep").replace(/_/g, " ")', 2)
     source = once(source, '    const on = w.active;\n',
                   '    const on = w.active;\n    const disconnected = (shared("containers.down") ?? []).includes(w.machine);\n')
     source = once(source, '      .when(on, (el) => el.bg(t.selected))\n',
@@ -43,8 +47,8 @@ def spaces(source):
                   '.rounded(5).bg(disconnected ? t.raised : fill).items_center().justify_center().text_size(10.5).font_bold().text_color(disconnected ? t.dim : "#ffffff")')
     source = once(source, '      .child(div().text_color(w.active ? t.foreground : t.muted).child(String(i + 1)))',
                   '      .child(div().text_color((shared("containers.down") ?? []).includes(w.machine) ? t.dim : w.active ? t.foreground : t.muted).child(String(i + 1)))')
-    source = once(source, '      .child(div().text_color(tone(t, w.status)).child(glyph(w.status)));',
-                  '      .child(div().text_color((shared("containers.down") ?? []).includes(w.machine) ? t.dim : tone(t, w.status)).child(glyph(w.status)));')
+    source = once(source, '      .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));',
+                  '      .child(div().absolute().right(5).text_color((shared("containers.down") ?? []).includes(w.machine) ? t.dim : tone(t, w.status)).child(glyph(w.status))));')
     source = once(source, '  gitTail(g, tree, name, t) {',
                   '  gitTail(g, tree, name, t, disconnected = false) {')
     source = once(source, '.when(g.ahead > 0, (el) => el.child(div().flex_none().text_color(t.ansi2).child(`\\u2191${g.ahead}`)))',
