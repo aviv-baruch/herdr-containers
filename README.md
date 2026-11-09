@@ -15,7 +15,7 @@ The demo plays at 2x speed ([MP4](herdr-containers/demo.mp4)). The still is [pre
 
 ## Requirements
 
-- Herdr app 0.1.13 and its core (`hc`). The four cloned mods track this version.
+- Herdr app 0.1.14 and its core (`hc`). The four cloned mods track this version.
 - `requirements/hc-devcontainer` on the PATH seen by both app and core.
 - Recommended, so dev containers open exactly as in VS Code: VS Code with its Dev Containers extension on this host (the helper runs the extension's own engine with VS Code's Electron; nothing else to install), or the [Dev Containers CLI](https://github.com/devcontainers/cli) (`npm install -g @devcontainers/cli`, which needs Node.js) on the PATH seen by both app and core. Without either, the helper uses plain `docker exec`. See [VS Code parity](#vs-code-parity).
 - Docker, or a Docker-compatible `podman` command on that host (`HC_DEVCONTAINER_DOCKER=podman`). A plain container needs `sh` to connect.
@@ -98,7 +98,7 @@ In shipped `main`, those three blocks become:
 ]
 ```
 
-Edit the existing blocks in place; their positions do not change. The footer opens the installed `settings-containers` mod. Keep its `"props": { "footer": true }`. Without the swaps, the shipped Spaces group can linger for 15 s after disconnect, unreachable spaces do not dim, Agents has no Disconnected group, and footer Settings has no Containers switches; both visibility options stay on. The swaps are copies of Herdr app 0.1.13's shipped mods, so compare before replacing an older or customized version. They need rebuilding and reinstalling to receive fixes from later Herdr releases.
+Edit the existing blocks in place; their positions do not change. The footer opens the installed `settings-containers` mod. Keep its `"props": { "footer": true }`. Without the swaps, the shipped Spaces group can linger for 15 s after disconnect, unreachable spaces do not dim, Agents has no Disconnected group, and footer Settings has no Containers switches; both visibility options stay on. The swaps are copies of Herdr app 0.1.14's shipped mods, so compare before replacing an older or customized version. They need rebuilding and reinstalling to receive fixes from later Herdr releases.
 
 Check each installed mod and the app status. Herdr reloads layout edits live; no layout switch is needed. `herdr-app check` needs a display.
 
