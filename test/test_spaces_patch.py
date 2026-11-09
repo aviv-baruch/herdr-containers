@@ -25,6 +25,34 @@ class PatchTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", str(PATCHER), str(source), str(target),
                                "herdr-app 1.2.3"], capture_output=True, text=True)
 
+    def test_spaces_state_labels_patch_both_views(self):
+        anchor = '(machine?.state ?? "asleep").replace(/_/g, " ")'
+        replacement = '(down.has(m) ? "disconnected" : machine?.state ?? "asleep").replace(/_/g, " ")'
+        with tempfile.TemporaryDirectory(dir=ROOT / "test") as temp:
+            target = Path(temp) / "spaces-containers"
+            run = self.run_patcher(DEFAULTS / "mods/spaces", target)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            patched = (target / "main.js").read_text()
+            self.assertEqual(patched.count(replacement), 2)
+            self.assertEqual(patched.count(anchor), 0)
+
+    def test_spaces_state_anchor_requires_exactly_two_matches(self):
+        anchor = '(machine?.state ?? "asleep").replace(/_/g, " ")'
+        for count in (1, 3):
+            with self.subTest(count=count), tempfile.TemporaryDirectory(dir=ROOT / "test") as temp:
+                source = Path(temp) / "spaces"
+                target = Path(temp) / "spaces-containers"
+                shutil.copytree(DEFAULTS / "mods/spaces", source)
+                main = source / "main.js"
+                text = main.read_text()
+                main.write_text(text.replace(anchor, "MANGLED", 1) if count == 1 else text + f"\n// {anchor}\n")
+                target.mkdir()
+                (target / "old.txt").write_text("old clone")
+                run = self.run_patcher(source, target)
+                self.assertEqual(run.returncode, 1)
+                self.assertIn(f"patch anchor matched {count} times", run.stderr)
+                self.assertEqual([p.name for p in target.iterdir()], ["old.txt"])
+
     def test_reference_applies_and_is_valid_js(self):
         for original, clone, rel, anchor, result in CASES:
             reference = DEFAULTS / rel
