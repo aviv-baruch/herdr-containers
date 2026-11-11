@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Clones rebuilt for Herdr 0.1.15.
 - Clones rebuilt for Herdr 0.1.14.
 - Clones rebuilt for Herdr 0.1.13.
 - Clones rebuilt for Herdr 0.1.12.
