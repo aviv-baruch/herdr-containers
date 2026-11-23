@@ -1,0 +1,211 @@
+From f062b5ea6897ae1b5e803f37c68bd8deafdc102f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 12:50:01 +0000
+Subject: [PATCH] fix: draw on the gpu in wsl2 through mesa's d3d12 driver
+
+---
+ README.md      |   2 +-
+ src/links.rs   |   2 +-
+ src/main.rs    |   3 ++
+ src/spawn.rs   |   5 ++-
+ src/update.rs  |   2 +-
+ src/wsl_gpu.rs | 107 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 116 insertions(+), 5 deletions(-)
+ create mode 100644 src/wsl_gpu.rs
+
+diff --git a/README.md b/README.md
+index c7c66d2..ddf0757 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see
+ curl -fsSL https://releases.herdr.dev/app/install.sh | sh
+ ```
+ 
+-Linux needs a desktop session and a working Vulkan driver. macOS builds are available for Apple Silicon; Intel Mac users can [build from source](#build-from-source). Linux builds are x86-64 and ARM64.
++Linux needs a desktop session and a working Vulkan driver. In WSL2, Herdr draws on your GPU through Mesa's Direct3D 12 driver instead; to choose another driver, start it with `GALLIUM_DRIVER` set, for example `GALLIUM_DRIVER=llvmpipe herdr-app`. macOS builds are available for Apple Silicon; Intel Mac users can [build from source](#build-from-source). Linux builds are x86-64 and ARM64.
+ 
+ The installer adds Herdr to your apps and puts the command in `~/.local/bin`.
+ Add that folder to your PATH if the installer asks.
+diff --git a/src/links.rs b/src/links.rs
+index 5de7719..89cba07 100644
+--- a/src/links.rs
++++ b/src/links.rs
+@@ -379,7 +379,7 @@ fn open_system(arg: &std::ffi::OsStr) {
+ #[cfg(not(windows))]
+ fn open_system(arg: &std::ffi::OsStr) {
+     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+-    let spawned = std::process::Command::new(opener)
++    let spawned = crate::spawn::command(opener)
+         .arg(arg)
+         .stdin(std::process::Stdio::null())
+         .stdout(std::process::Stdio::null())
+diff --git a/src/main.rs b/src/main.rs
+index 34d47aa..1d774fa 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -40,6 +40,7 @@ mod update_notes;
+ mod vt;
+ mod win32_keys;
+ mod window;
++mod wsl_gpu;
+ 
+ use gpui::*;
+ 
+@@ -148,6 +149,8 @@ fn main() {
+     if update::apply_on_startup() {
+         return;
+     }
++    // Still before any thread: it sets an environment variable.
++    wsl_gpu::startup();
+ 
+     telemetry::clock();
+     // A first start sizes the app to the screen and the system's text size.
+diff --git a/src/spawn.rs b/src/spawn.rs
+index 0987554..7bc0440 100644
+--- a/src/spawn.rs
++++ b/src/spawn.rs
+@@ -1,12 +1,13 @@
+ //! Starting programs. The app has no console on Windows, so each console
+-//! program it starts (git, hc, curl) would open a window of its own.
++//! program it starts (git, hc, curl) would open a window of its own. In WSL
++//! they don't inherit the window's GPU driver (wsl_gpu.rs).
+ 
+ use std::ffi::OsStr;
+ use std::process::Command;
+ 
+ pub fn command(program: impl AsRef<OsStr>) -> Command {
+-    #[allow(unused_mut)]
+     let mut cmd = Command::new(program);
++    crate::wsl_gpu::hide(&mut cmd);
+     #[cfg(windows)]
+     {
+         use std::os::windows::process::CommandExt;
+diff --git a/src/update.rs b/src/update.rs
+index c3a5f21..b59c8c1 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -554,7 +554,7 @@ fn relaunch_expected(expected: Option<&str>) -> bool {
+     let script = format!("while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; {open}");
+     let spawned = {
+         use std::os::unix::process::CommandExt;
+-        let mut command = Command::new("sh");
++        let mut command = crate::spawn::command("sh");
+         if let Some(expected) = expected {
+             command.env("HERDR_APP_UPDATE_EXPECTED", expected);
+         }
+diff --git a/src/wsl_gpu.rs b/src/wsl_gpu.rs
+new file mode 100644
+index 0000000..ed160cc
+--- /dev/null
++++ b/src/wsl_gpu.rs
+@@ -0,0 +1,107 @@
++//! WSL2 reaches the GPU only through /dev/dxg, in Direct3D 12. Ubuntu's Mesa
++//! has no Vulkan driver for it, and its OpenGL default (zink) refuses the CPU
++//! Vulkan driver, so wgpu drew on lavapipe: every frame on the CPU. Mesa's
++//! d3d12 OpenGL driver is installed but only used when named, so the window
++//! names it. Programs the app starts never see that choice.
++
++use std::ffi::OsString;
++use std::process::Command;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++const DRIVER: &str = "GALLIUM_DRIVER";
++/// Mesa choices of the person's own; any of them, even empty, leaves Mesa alone.
++const CHOSEN: [&str; 3] = [DRIVER, "LIBGL_ALWAYS_SOFTWARE", "MESA_LOADER_DRIVER_OVERRIDE"];
++static NAMED: AtomicBool = AtomicBool::new(false);
++
++/// In WSL2, draws through d3d12 unless the person chose a Mesa driver.
++/// Call before any thread starts: it sets an environment variable.
++pub fn startup() {
++    if !cfg!(target_os = "linux") {
++        return;
++    }
++    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
++    if wants_d3d12(&release, std::path::Path::new("/dev/dxg").exists(), |name: &str| std::env::var_os(name)) {
++        // SAFETY: main calls this before any thread starts.
++        unsafe { std::env::set_var(DRIVER, "d3d12") };
++        NAMED.store(true, Ordering::Relaxed);
++        tracing::info!("WSL: drawing on the GPU through Direct3D 12 ({DRIVER}=d3d12; set {DRIVER} to choose another driver)");
++    }
++}
++
++/// WSL (its kernel, or a session it started) with the GPU channel, and no driver chosen.
++fn wants_d3d12(release: &str, dxg: bool, var: impl Fn(&str) -> Option<OsString>) -> bool {
++    let release = release.to_ascii_lowercase();
++    let wsl = release.contains("microsoft") || release.contains("wsl") || var("WSL_DISTRO_NAME").is_some();
++    wsl && dxg && CHOSEN.iter().all(|name| var(name).is_none())
++}
++
++/// Keeps the window's driver out of a program the app starts: the core (and
++/// so every terminal), mods' programs, link openers, the relaunched app.
++pub fn hide(command: &mut Command) {
++    hide_if(command, NAMED.load(Ordering::Relaxed));
++}
++
++fn hide_if(command: &mut Command, named: bool) {
++    if named {
++        command.env_remove(DRIVER);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const WSL2: &str = "6.6.87.2-microsoft-standard-WSL2\n";
++    const LINUX: &str = "6.8.0-48-generic\n";
++
++    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
++        move |name| vars.iter().find(|(key, _)| *key == name).map(|(_, value)| value.into())
++    }
++
++    fn removed(command: &Command) -> bool {
++        command.get_envs().any(|(key, value)| key == DRIVER && value.is_none())
++    }
++
++    #[test]
++    fn wsl2_with_its_gpu_channel_draws_through_d3d12() {
++        assert!(wants_d3d12(WSL2, true, env(&[])));
++        // A custom kernel: the session WSL started still says so.
++        assert!(wants_d3d12("6.18.0-custom\n", true, env(&[("WSL_DISTRO_NAME", "Ubuntu")])));
++    }
++
++    #[test]
++    fn other_linux_and_wsl_without_its_gpu_keep_their_driver() {
++        assert!(!wants_d3d12(LINUX, false, env(&[])));
++        // A Linux VM with a GPU partition has /dev/dxg too, but is not WSL.
++        assert!(!wants_d3d12(LINUX, true, env(&[])));
++        // WSL1, or WSL2 with its GPU turned off: no /dev/dxg to draw on.
++        assert!(!wants_d3d12("4.4.0-19041-Microsoft\n", false, env(&[("WSL_DISTRO_NAME", "Ubuntu")])));
++        assert!(!wants_d3d12(WSL2, false, env(&[])));
++    }
++
++    #[test]
++    fn a_mesa_driver_the_person_chose_wins_even_empty() {
++        for name in CHOSEN {
++            for value in ["llvmpipe", "1", ""] {
++                assert!(!wants_d3d12(WSL2, true, env(&[(name, value)])), "{name}={value:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn programs_keep_the_environment_they_had() {
++        let mut ours = Command::new("true");
++        hide_if(&mut ours, true);
++        assert!(removed(&ours));
++        let mut persons = Command::new("true");
++        hide_if(&mut persons, false);
++        assert_eq!(persons.get_envs().count(), 0);
++    }
++
++    #[test]
++    fn programs_started_through_spawn_command_never_see_the_windows_driver() {
++        // Never cleared: removing a variable nobody set changes nothing for other tests.
++        NAMED.store(true, Ordering::Relaxed);
++        assert!(removed(&crate::spawn::command("true")));
++    }
++}
+-- 
+2.43.0
+

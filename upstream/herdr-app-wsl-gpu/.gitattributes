@@ -1,0 +1,2 @@
+# git am needs the patch byte for byte, blank context lines included.
+*.patch -whitespace
