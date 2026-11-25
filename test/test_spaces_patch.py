@@ -36,6 +36,15 @@ class PatchTests(unittest.TestCase):
             self.assertEqual(patched.count(replacement), 2)
             self.assertEqual(patched.count(anchor), 0)
 
+    def test_spaces_dims_disconnected_space_name(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "test") as temp:
+            target = Path(temp) / "spaces-containers"
+            run = self.run_patcher(DEFAULTS / "mods/spaces", target)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            patched = (target / "main.js").read_text()
+            self.assertEqual(patched.count(".truncate().text_color(disconnected ? t.dim : t.foreground).child(w.name)"), 1)
+            self.assertNotIn(".truncate().text_color(t.foreground).child(w.name)", patched)
+
     def test_spaces_state_anchor_requires_exactly_two_matches(self):
         anchor = '(machine?.state ?? "asleep").replace(/_/g, " ")'
         for count in (1, 3):

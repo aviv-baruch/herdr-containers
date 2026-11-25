@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Clones rebuilt for Herdr 0.1.18.
+- Spaces and Settings patch anchors match Herdr 0.1.16+ (the space name's
+  new width props, the Settings `notify` import); daily rebuilds had failed
+  since 0.1.16.
 - Clones rebuilt for Herdr 0.1.15.
 - Clones rebuilt for Herdr 0.1.14.
 - Clones rebuilt for Herdr 0.1.13.
