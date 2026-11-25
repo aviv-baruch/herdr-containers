@@ -41,8 +41,8 @@ def spaces(source):
                   '    const on = w.active;\n    const disconnected = (shared("containers.down") ?? []).includes(w.machine);\n')
     source = once(source, '      .when(on, (el) => el.bg(t.selected))\n',
                   '      .when(on, (el) => el.bg(t.selected))\n      .when(disconnected, (el) => el.text_color(t.dim))\n')
-    source = once(source, '.max_w(150).truncate().text_color(t.foreground).child(w.name)',
-                  '.max_w(150).truncate().text_color(disconnected ? t.dim : t.foreground).child(w.name)')
+    source = once(source, '.truncate().text_color(t.foreground).child(w.name)',
+                  '.truncate().text_color(disconnected ? t.dim : t.foreground).child(w.name)')
     source = once(source, '.rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff")',
                   '.rounded(5).bg(disconnected ? t.raised : fill).items_center().justify_center().text_size(10.5).font_bold().text_color(disconnected ? t.dim : "#ffffff")')
     source = once(source, '      .child(div().text_color(w.active ? t.foreground : t.muted).child(String(i + 1)))',
@@ -102,8 +102,8 @@ def agents(source):
 def settings(source):
     source = once(source, 'const I = (name) => `frame/settings/${name}.svg`;',
                   'const I = (name) => `mods/settings-containers/${name}.svg`;')
-    source = once(source, 'props, closeOverlay, window } from "herdr";',
-                  'props, closeOverlay, window, setShared } from "herdr";')
+    source = once(source, ' window } from "herdr";',
+                  ' window, setShared } from "herdr";')
     source = once(source, '  { id: "machines", title: "Machines", icon: "server" },\n',
                   '  { id: "machines", title: "Machines", icon: "server" },\n'
                   '  { id: "containers", title: "Containers", icon: "server" },\n')
